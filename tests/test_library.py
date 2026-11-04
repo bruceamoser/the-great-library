@@ -29,7 +29,7 @@ class LibraryTests(unittest.TestCase):
     def test_index_rebuild_replaces_existing_pages(self):
         args=(ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db,'--workers','1')
         self.command(*args);self.command(*args,'--rebuild')
-        self.assertEqual(self.query('select count(*) from pdf_fts'),[(1,)])
+        self.assertEqual(self.query('select count(*) from pdf_pages'),[(1,)])
         import pymupdf
         doc=pymupdf.open();p=doc.new_page();p.insert_text((70,70),'replacement gryphon text');doc.save(self.folder/'Corebook.pdf');doc.close()
         self.command(*args,'--rebuild');self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'ancient'"),[(0,)])
@@ -44,6 +44,16 @@ class LibraryTests(unittest.TestCase):
         r=c.get('/search?q=dragon&cat=book&section=files');self.assertEqual(r.status_code,200);self.assertIn('dragon-notes.txt</a>',r.text)
         self.assertEqual(c.get('/search?q=AND&section=content').status_code,200)
         self.assertEqual(c.get('/search?page=-5').status_code,200)
+    def test_content_search_reads_external_content_index(self):
+        self.command(ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db,'--workers','1')
+        c=self.client();r=c.get('/search?q=dragon&section=content')
+        self.assertEqual(r.status_code,200,r.text)
+        self.assertIn('Inside documents',r.text)
+        self.assertIn('Corebook.pdf',r.text)
+        self.assertIn('<mark>dragon</mark>',r.text)
+        # The content total joins pages back to files, so category filters apply.
+        self.assertIn('Inside documents',c.get('/search?q=dragon&section=content&cat=book').text)
+        self.assertNotIn('Corebook.pdf',c.get('/search?q=dragon&section=content&cat=asset').text)
     def test_suffix_ranges_and_unicode_filename(self):
         c=self.client();fid=self.query("select id from files where filename='dragon-notes.txt'")[0][0]
         r=c.get('/raw/'+str(fid),headers={'Range':'bytes=-2'});self.assertEqual(r.status_code,206);self.assertEqual(r.content,b'es')

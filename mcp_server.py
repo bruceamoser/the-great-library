@@ -296,7 +296,7 @@ def read_pages(file_id: int, first_page: int = 1, last_page: int | None = None) 
         first = max(1, first_page)
         last = max(first, min(last_page or first, first + 19))   # cap the payload
         rows = con.execute(
-            'SELECT page, text FROM pdf_fts WHERE rel_path = ? AND page BETWEEN ?'
+            'SELECT page, text FROM pdf_pages WHERE rel_path = ? AND page BETWEEN ?'
             ' AND ? ORDER BY page', (f['rel_path'], first, last)).fetchall()
         if not rows:
             return (f'No indexed text for pages {first}-{last} of {f["filename"]}. '
@@ -326,9 +326,10 @@ def mechanic_across_systems(term: str, limit: int = 12) -> str:
     try:
         rows = con.execute(
             """SELECT c.id cid, c.name, c.shelf, COUNT(*) hits,
-                      COUNT(DISTINCT p.rel_path) books
-               FROM pdf_fts p
-               JOIN files f ON f.rel_path = p.rel_path
+                      COUNT(DISTINCT pp.rel_path) books
+               FROM pdf_fts
+               JOIN pdf_pages pp ON pp.id = pdf_fts.rowid
+               JOIN files f ON f.rel_path = pp.rel_path
                JOIN collections c ON c.id = f.collection_id
                WHERE pdf_fts MATCH ?
                GROUP BY c.id ORDER BY hits DESC LIMIT ?""",

@@ -239,12 +239,13 @@ def content_search(con, q: str, limit: int = 60):
         return []
     try:
         return con.execute(
-            """SELECT f.id AS fid, p.page AS page, f.filename AS filename,
+            """SELECT f.id AS fid, pp.page AS page, f.filename AS filename,
                       f.collection_id AS cid, c.name AS collection_name,
                       c.shelf AS shelf,
-                      snippet(pdf_fts, 2, '<<', '>>', ' … ', 14) AS snip
-               FROM pdf_fts p
-               JOIN files f ON f.rel_path = p.rel_path
+                      snippet(pdf_fts, 0, '<<', '>>', ' … ', 14) AS snip
+               FROM pdf_fts
+               JOIN pdf_pages pp ON pp.id = pdf_fts.rowid
+               JOIN files f ON f.rel_path = pp.rel_path
                JOIN collections c ON c.id = f.collection_id
                WHERE pdf_fts MATCH ?
                ORDER BY rank LIMIT ?""", (fts_query(q), limit)).fetchall()
@@ -375,7 +376,7 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
     join=' FROM files f JOIN collections c ON c.id=f.collection_id WHERE '
     totals['files']=con.execute('SELECT COUNT(*)'+join+fw,fp).fetchone()[0]
     pw='pdf_fts MATCH ? AND '+filters; pp=[match]+params
-    pj=' FROM pdf_fts p JOIN files f ON f.rel_path=p.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
+    pj=' FROM pdf_fts JOIN pdf_pages pp ON pp.id=pdf_fts.rowid JOIN files f ON f.rel_path=pp.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
     index_available=True
     try:
         totals['content']=con.execute('SELECT COUNT(*)'+pj+pw,pp).fetchone()[0] if match else 0
@@ -391,7 +392,7 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         order='f.size DESC,f.id' if sort=='size' else 'f.filename COLLATE NOCASE,f.id'
         files=con.execute('SELECT f.*,c.name collection_name,c.shelf'+join+fw+' ORDER BY '+order+' LIMIT ? OFFSET ?',fp+[size,offset]).fetchall()
     elif match and index_available:
-        content_hits=con.execute("SELECT f.id fid,p.page,f.filename,c.id cid,c.name collection_name,c.shelf,snippet(pdf_fts,2,'<<','>>',' … ',24) snip"+pj+pw+' ORDER BY rank LIMIT ? OFFSET ?',pp+[size,offset]).fetchall()
+        content_hits=con.execute("SELECT f.id fid,pp.page,f.filename,c.id cid,c.name collection_name,c.shelf,snippet(pdf_fts,0,'<<','>>',' … ',24) snip"+pj+pw+' ORDER BY rank LIMIT ? OFFSET ?',pp+[size,offset]).fetchall()
     all_tags=con.execute('SELECT name FROM tags ORDER BY name').fetchall()
     shelves=con.execute('SELECT DISTINCT shelf FROM collections ORDER BY shelf').fetchall()
     con.close()

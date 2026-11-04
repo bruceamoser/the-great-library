@@ -5,11 +5,25 @@ web app can search *inside* documents, not just filenames.
 
 Stores results in `library.db`:
 
-  pdf_fts     virtual FTS5 table (rel_path, page, text)
+  pdf_pages   one row per page: id, rel_path, page, text
+  pdf_fts     FTS5 index over pdf_pages.text (external content, content_rowid=id)
   pdf_status  one row per indexed file (rel_path, mtime, pages, chars)
 
-Keyed on `rel_path` rather than file id, so rebuilding the catalog with
-`catalog.py` (which recreates the `files` table) does not orphan the index.
+The text lives once, in `pdf_pages`; `pdf_fts` indexes it by integer rowid and
+reads the text back from `pdf_pages` (external content). The old layout kept
+the text in the FTS table's own content table, stored the full relative path
+and page number on every one of ~310k FTS rows, and joined hits back to
+`files` on a string.
+
+`pdf_pages` is keyed on `rel_path` rather than file id, so rebuilding the
+catalog with `catalog.py` (which recreates the `files` table) does not orphan
+the index. It is not a catalog table and survives a rescan.
+
+Upgrading an existing database: `--migrate` copies the text out of the old
+`pdf_fts` layout, rebuilds the index against `pdf_pages`, drops the obsolete
+`pdf_page_map` and (optionally) VACUUMs. It is idempotent and is also run
+automatically at the start of every indexing pass. `--rebuild` still means
+"re-extract every PDF"; the migration is not a rebuild.
 
 Runs the extraction across a process pool; only the parent writes to SQLite.
 Re-running is cheap: files whose mtime is unchanged are skipped unless
@@ -24,8 +38,8 @@ starved and runs ~25x slower.
 
 Usage:
   ionice -c2 -n7 nice -n 19 python3 index_pdf_text.py \
-      --library /mnt/disk5/RPG-Library --db library.db [--workers 3]
-      [--rebuild] [--limit N]
+      --library /mnt/disk5/RPG-Library --db library.db [--workers 3] \
+      [--rebuild] [--limit N] [--migrate [--vacuum]]
 """
 import argparse
 import os
@@ -36,7 +50,7 @@ from multiprocessing import Pool
 
 MAX_PAGE_CHARS = 200_000
 
-SCHEMA = """
+STATUS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pdf_status (
   rel_path   TEXT PRIMARY KEY,
   mtime      REAL,
@@ -44,13 +58,134 @@ CREATE TABLE IF NOT EXISTS pdf_status (
   chars      INTEGER,
   indexed_at REAL
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS pdf_fts USING fts5(
-  rel_path UNINDEXED,
-  page UNINDEXED,
+"""
+
+PAGES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pdf_pages (
+  id       INTEGER PRIMARY KEY,
+  rel_path TEXT NOT NULL,
+  page     INTEGER,
+  text     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pdf_pages_path_page ON pdf_pages(rel_path, page);
+"""
+
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE pdf_fts USING fts5(
   text,
+  content = 'pdf_pages',
+  content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
 );
 """
+
+# Keep pdf_fts in sync with its content table. The explicit 'delete' command
+# with the old text is what FTS5 external-content tables require; a plain
+# DELETE against pdf_fts would leave the index claiming tokens that are gone.
+TRIGGER_SCHEMA = """
+CREATE TRIGGER IF NOT EXISTS pdf_pages_ai AFTER INSERT ON pdf_pages BEGIN
+  INSERT INTO pdf_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS pdf_pages_ad AFTER DELETE ON pdf_pages BEGIN
+  INSERT INTO pdf_fts(pdf_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS pdf_pages_au AFTER UPDATE ON pdf_pages BEGIN
+  INSERT INTO pdf_fts(pdf_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  INSERT INTO pdf_fts(rowid, text) VALUES (new.id, new.text);
+END;
+"""
+
+TRIGGERS = ('pdf_pages_ai', 'pdf_pages_ad', 'pdf_pages_au')
+
+
+def _table_exists(con, name):
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
+        (name,)).fetchone() is not None
+
+
+def _columns(con, name):
+    return [row[1] for row in con.execute(f'PRAGMA table_info("{name}")')]
+
+
+def _triggers_present(con):
+    rows = con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (?,?,?)",
+        TRIGGERS).fetchall()
+    return len(rows) == len(TRIGGERS)
+
+
+def migrate(con, log=print):
+    """Upgrade the PDF page index to integer keys + external content.
+
+    Idempotent: a database already on the new layout is left untouched (no
+    rebuild), so this is cheap to call before every indexing pass. An
+    interrupted migration is detected by the missing triggers and redone; the
+    text is never lost before the new index has been committed.
+    """
+    con.executescript(STATUS_SCHEMA)
+    has_fts = _table_exists(con, 'pdf_fts')
+    columns = _columns(con, 'pdf_fts') if has_fts else []
+    old_layout = 'rel_path' in columns
+    has_pages = _table_exists(con, 'pdf_pages')
+
+    if has_pages and not old_layout and _triggers_present(con):
+        # Already current. The index statement is IF NOT EXISTS and covers the
+        # case where somebody dropped just the b-tree.
+        con.executescript(PAGES_SCHEMA)
+        return False
+
+    if old_layout:
+        for trigger in TRIGGERS:
+            con.execute(f'DROP TRIGGER IF EXISTS {trigger}')
+        con.executescript(PAGES_SCHEMA)
+        # Clear a partial copy from an interrupted earlier attempt before
+        # recopying; the old index is still intact at this point.
+        con.execute('DELETE FROM pdf_pages')
+        copied = con.execute(
+            "INSERT INTO pdf_pages(rel_path, page, text) "
+            "SELECT rel_path, CAST(page AS INTEGER), text FROM pdf_fts "
+            "WHERE text IS NOT NULL").rowcount
+        con.commit()
+        log(f'  copied {copied:,} pages from the old pdf_fts')
+        con.execute('DROP TABLE pdf_fts')
+        con.execute('DROP TABLE IF EXISTS pdf_page_map')
+        con.commit()
+    else:
+        con.executescript(PAGES_SCHEMA)
+
+    # Build a fresh index against the content table. A leftover pdf_fts from an
+    # interrupted migration is dropped first so its segments cannot disagree
+    # with pdf_pages.
+    con.execute('DROP TABLE IF EXISTS pdf_fts')
+    con.executescript(FTS_SCHEMA)
+    pages = con.execute('SELECT COUNT(*) FROM pdf_pages').fetchone()[0]
+    log(f'  rebuilding the FTS index over {pages:,} pages ...')
+    con.execute("INSERT INTO pdf_fts(pdf_fts) VALUES('rebuild')")
+    con.commit()
+    con.executescript(TRIGGER_SCHEMA)
+    con.commit()
+    log('  index schema: pdf_pages + pdf_fts (external content)')
+    return True
+
+
+def _bytes(n):
+    return f'{n / 1e9:.2f} GB' if n >= 1e9 else f'{n / 1e6:.1f} MB'
+
+
+def _report_sizes(con, path, before):
+    """Print the on-disk size and freelist, before and after a VACUUM."""
+    page_size = con.execute('PRAGMA page_size').fetchone()[0]
+    free = con.execute('PRAGMA freelist_count').fetchone()[0]
+    con.commit()
+    con.execute('VACUUM')
+    con.commit()
+    # Fold the WAL back into the main file so the size we print is real.
+    con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    after = os.path.getsize(path) if os.path.exists(path) else 0
+    print(f'database      : {_bytes(before)} -> {_bytes(after)} '
+          f'({_bytes(max(0, before - after))} reclaimed)')
+    print(f'freelist      : {free:,} pages ({_bytes(free * page_size)}) before VACUUM')
 
 
 def extract(job):
@@ -85,19 +220,22 @@ def main():
     ap.add_argument('--workers', type=int, default=3)
     ap.add_argument('--rebuild', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--migrate', action='store_true',
+                    help='upgrade the index schema, then exit without extracting')
+    ap.add_argument('--vacuum', action='store_true',
+                    help='VACUUM the database after --migrate')
     args = ap.parse_args()
 
     library = os.path.abspath(args.library)
+    existed = os.path.exists(args.db)
+    before = os.path.getsize(args.db) if existed else 0
     con = sqlite3.connect(args.db, timeout=60)
-    con.executescript(SCHEMA)
-    # FTS path columns are unindexed. A companion rowid map avoids scanning
-    # every indexed page once per changed PDF during a full rebuild.
-    mapped=con.execute("SELECT 1 FROM sqlite_master WHERE name='pdf_page_map'").fetchone()
-    con.execute('CREATE TABLE IF NOT EXISTS pdf_page_map(rel_path TEXT NOT NULL, fts_rowid INTEGER PRIMARY KEY)')
-    con.execute('CREATE INDEX IF NOT EXISTS pdf_page_path ON pdf_page_map(rel_path)')
-    if not mapped:
-        con.execute('INSERT INTO pdf_page_map SELECT rel_path,rowid FROM pdf_fts')
-    con.commit()
+    migrate(con)
+    if args.migrate:
+        if args.vacuum:
+            _report_sizes(con, args.db, before)
+        con.close()
+        return 0
 
     done = {}
     if not args.rebuild:
@@ -125,6 +263,7 @@ def main():
     print(f"to process      : {len(jobs)}")
     if not jobs:
         print("nothing to do")
+        con.close()
         return 0
 
     t0 = time.time()
@@ -132,21 +271,22 @@ def main():
     chars_total = 0
     batch = []
     cur_rows = []
-    cur_fts = []
+    cur_pages = []
 
     def flush():
-        nonlocal batch, cur_rows, cur_fts
+        nonlocal batch, cur_rows, cur_pages
         if not batch:
             return
-        con.executemany('DELETE FROM pdf_fts WHERE rowid IN (SELECT fts_rowid FROM pdf_page_map WHERE rel_path=?)', [(r,) for r in batch])
-        con.executemany('DELETE FROM pdf_page_map WHERE rel_path=?',[(r,) for r in batch])
+        # Deleting the content rows fires the FTS delete triggers; inserting
+        # them fires the insert triggers. The index is never written directly.
+        con.executemany('DELETE FROM pdf_pages WHERE rel_path=?',
+                        [(r,) for r in batch])
         con.executemany(
             'INSERT OR REPLACE INTO pdf_status VALUES (?,?,?,?,?)', cur_rows)
-        for rel, page, text in cur_fts:
-            cursor=con.execute('INSERT INTO pdf_fts (rel_path,page,text) VALUES (?,?,?)',(rel,page,text))
-            con.execute('INSERT INTO pdf_page_map VALUES (?,?)',(rel,cursor.lastrowid))
+        con.executemany(
+            'INSERT INTO pdf_pages(rel_path, page, text) VALUES (?,?,?)', cur_pages)
         con.commit()
-        batch, cur_rows, cur_fts = [], [], []
+        batch, cur_rows, cur_pages = [], [], []
 
     with Pool(args.workers) as pool:
         for n, res in enumerate(pool.imap_unordered(extract, jobs, chunksize=1), 1):
@@ -160,7 +300,7 @@ def main():
             chars_total += chars
             cur_rows.append((rel_path, mtime, pages, chars, time.time()))
             for page, txt in page_rows:
-                cur_fts.append((rel_path, page, txt))
+                cur_pages.append((rel_path, page, txt))
             batch.append(rel_path)
             processed += 1
             if len(batch) >= 40:
@@ -177,18 +317,16 @@ def main():
     # Self-heal: drop index rows whose file no longer exists in the catalog
     # (moving files changes rel_path and would otherwise orphan them).
     try:
-        stale = con.execute(
-            'SELECT rowid FROM pdf_fts WHERE rel_path NOT IN '
-            '(SELECT rel_path FROM files)').fetchall()
-        if stale:
-            con.executemany('DELETE FROM pdf_fts WHERE rowid = ?', stale)
+        cur = con.execute(
+            'DELETE FROM pdf_pages WHERE rel_path NOT IN '
+            '(SELECT rel_path FROM files)')
+        n_stale_pages = cur.rowcount
         n_stale = con.execute(
             'DELETE FROM pdf_status WHERE rel_path NOT IN '
             '(SELECT rel_path FROM files)').rowcount
-        con.execute('DELETE FROM pdf_page_map WHERE rel_path NOT IN (SELECT rel_path FROM files)')
         con.commit()
-        if n_stale or stale:
-            print(f"pruned stale  : {n_stale} files, {len(stale)} pages")
+        if n_stale or n_stale_pages:
+            print(f"pruned stale  : {n_stale} files, {n_stale_pages} pages")
     except sqlite3.OperationalError:
         pass
 
