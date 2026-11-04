@@ -385,6 +385,16 @@ Measured on this machine, full rebuild of the restructured library
 A full rebuild takes an hour-plus because every PDF must be re-extracted; an
 incremental run only touches files whose mtime changed.
 
+Writes are batched by volume (about 12 MB of page text, or 200 files, per
+transaction — `--batch-mb` tunes it) and, **during a rebuild only**, the
+connection runs with `journal_mode=MEMORY`, `synchronous=OFF` and a 64 MB
+cache. The index is rebuildable, so giving up crash durability for the length
+of a rebuild is safe: an interruption loses at most the batch in flight, and
+the next run resumes from the last commit because finished files are already
+recorded in `pdf_status`. The previous pragmas are restored afterwards, so the
+live catalogue keeps its normal WAL durability; incremental runs never turn
+durability off.
+
 ### Why only 3 workers, and why `ionice`
 
 The library sits on a **single spinning disk** (WD Caviar Black, 120 MB/s

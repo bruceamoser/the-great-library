@@ -34,6 +34,79 @@ class LibraryTests(unittest.TestCase):
         doc=pymupdf.open();p=doc.new_page();p.insert_text((70,70),'replacement gryphon text');doc.save(self.folder/'Corebook.pdf');doc.close()
         self.command(*args,'--rebuild');self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'ancient'"),[(0,)])
         self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'gryphon'"),[(1,)])
+    def index_args(self,*extra):return (ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db,'--workers','1',*extra)
+    def make_pdfs(self,count):
+        import pymupdf
+        for i in range(count):
+            doc=pymupdf.open();p=doc.new_page();p.insert_text((70,70),f'bulk tome {i} indexable');doc.save(self.folder/f'Bulk-{i:03d}.pdf');doc.close()
+        self.scan()
+    def test_index_writer_buffers_by_volume_and_loses_only_the_open_batch(self):
+        import index_pdf_text
+        con=sqlite3.connect(self.db);index_pdf_text.ensure_schema(con)
+        writer=index_pdf_text.IndexWriter(con,1,batch_mb=0.005)
+        self.assertFalse(writer.add('a.pdf',1.0,2,3500,[(1,'alpha '*500),(2,'beta text')]))
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(0,)])
+        self.assertTrue(writer.add('b.pdf',2.0,1,2500,[(1,'gamma '*400)]))
+        writer.flush();self.assertEqual(writer.commits,1)
+        writer.add('c.pdf',3.0,1,2500,[(1,'delta '*400)])
+        con.close()
+        self.assertEqual(self.query('select rel_path from pdf_status order by 1'),[('a.pdf',),('b.pdf',)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(3,)])
+        self.assertEqual(self.query('select count(*) from pdf_page_map where fts_rowid not in (select rowid from pdf_fts)'),[(0,)])
+        con=sqlite3.connect(self.db);writer=index_pdf_text.IndexWriter(con,con.execute('select coalesce(max(rowid),0)+1 from pdf_fts').fetchone()[0])
+        writer.add('a.pdf',9.0,1,2500,[(1,'epsilon '*350)]);writer.flush();con.close()
+        self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'alpha'"),[(0,)])
+        self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'epsilon'"),[(1,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(2,)])
+    def test_interrupted_index_flushes_what_is_done_and_resumes(self):
+        import index_pdf_text
+        self.make_pdfs(3)
+        class InterruptingPool:
+            def __init__(self,*a,**k):pass
+            def __enter__(self):return self
+            def __exit__(self,*exc):return False
+            def imap_unordered(self,func,jobs,chunksize=1):
+                yield func(jobs[0]);raise KeyboardInterrupt
+        argv=['index_pdf_text.py','--library',str(self.library),'--db',str(self.db),'--workers','1']
+        with patch.object(index_pdf_text,'Pool',InterruptingPool),patch.object(sys,'argv',argv):
+            self.assertEqual(index_pdf_text.main(),130)
+        self.assertEqual(self.query('select count(*) from pdf_status'),[(1,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(1,)])
+        out=self.command(*self.index_args())
+        self.assertIn('processed      : 3',out.stdout)
+        self.assertEqual(self.query('select count(*) from pdf_status'),[(4,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(4,)])
+    def test_killed_index_is_consistent_and_resumable(self):
+        import time
+        self.make_pdfs(60)
+        proc=subprocess.Popen([sys.executable,*map(str,self.index_args('--batch-mb','0.001'))],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            deadline=time.time()+30
+            while time.time()<deadline and proc.poll() is None:
+                try:
+                    if self.query('select count(*) from pdf_status')[0][0]:break
+                except sqlite3.OperationalError:pass
+                time.sleep(0.01)
+        finally:
+            if proc.poll() is None:proc.kill()
+        proc.wait(timeout=30)
+        self.assertEqual(self.query('pragma integrity_check'),[('ok',)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),self.query('select count(*) from pdf_page_map'))
+        self.assertEqual(self.query('select count(*) from pdf_page_map where fts_rowid not in (select rowid from pdf_fts)'),[(0,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts where rowid not in (select fts_rowid from pdf_page_map)'),[(0,)])
+        self.assertEqual(self.query('select count(*) from (select rel_path,page from pdf_fts group by rel_path,page having count(*)>1)'),[(0,)])
+        for rel_path,mtime,pages,chars,_ in self.query('select rel_path,mtime,pages,chars,indexed_at from pdf_status'):
+            self.assertEqual((pages,chars==0),(1,False),rel_path)
+        self.command(*self.index_args())
+        self.assertEqual(self.query('select count(*) from pdf_status'),[(61,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(61,)])
+        self.assertIn('nothing to do',self.command(*self.index_args()).stdout)
+    def test_rebuild_restores_wal_journal_mode(self):
+        self.assertEqual(self.query('pragma journal_mode'),[('wal',)])
+        out=self.command(*self.index_args('--rebuild'))
+        self.assertIn('rebuild pragmas',out.stdout)
+        self.assertEqual(self.query('pragma journal_mode'),[('wal',)])
+        self.assertEqual(self.query('select count(*) from pdf_status'),[(1,)])
     def client(self):
         import app
         from fastapi.testclient import TestClient
