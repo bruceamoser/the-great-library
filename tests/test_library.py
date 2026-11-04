@@ -79,7 +79,10 @@ class LibraryTests(unittest.TestCase):
     def test_killed_index_is_consistent_and_resumable(self):
         import time
         self.make_pdfs(60)
-        proc=subprocess.Popen([sys.executable,*map(str,self.index_args('--batch-mb','0.001'))],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        # Kill a *rebuild*, because that is the run that relaxes pragmas: the
+        # catalogue must still be in WAL afterwards (MEMORY would be persistent
+        # in the file and leave the web app writing to a crash-unsafe database).
+        proc=subprocess.Popen([sys.executable,*map(str,self.index_args('--rebuild','--batch-mb','0.001'))],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
             deadline=time.time()+30
             while time.time()<deadline and proc.poll() is None:
@@ -90,6 +93,8 @@ class LibraryTests(unittest.TestCase):
         finally:
             if proc.poll() is None:proc.kill()
         proc.wait(timeout=30)
+        self.assertNotEqual(proc.returncode,0,'the kill landed after the run finished')
+        self.assertEqual(self.query('pragma journal_mode'),[('wal',)])
         self.assertEqual(self.query('pragma integrity_check'),[('ok',)])
         self.assertEqual(self.query('select count(*) from pdf_fts'),self.query('select count(*) from pdf_page_map'))
         self.assertEqual(self.query('select count(*) from pdf_page_map where fts_rowid not in (select rowid from pdf_fts)'),[(0,)])
@@ -101,12 +106,26 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(self.query('select count(*) from pdf_status'),[(61,)])
         self.assertEqual(self.query('select count(*) from pdf_fts'),[(61,)])
         self.assertIn('nothing to do',self.command(*self.index_args()).stdout)
-    def test_rebuild_restores_wal_journal_mode(self):
+    def test_rebuild_leaves_no_persistent_pragma_change(self):
+        # journal_mode lives in the database file: a rebuild must never switch
+        # the live catalogue to something crash-unsafe, even if killed.
         self.assertEqual(self.query('pragma journal_mode'),[('wal',)])
         out=self.command(*self.index_args('--rebuild'))
         self.assertIn('rebuild pragmas',out.stdout)
+        self.assertIn('journal_mode=wal',out.stdout)
         self.assertEqual(self.query('pragma journal_mode'),[('wal',)])
         self.assertEqual(self.query('select count(*) from pdf_status'),[(1,)])
+        # The relaxed settings are per-connection, so a new one gets the defaults.
+        with sqlite3.connect(self.db) as con:
+            self.assertNotEqual(con.execute('pragma synchronous').fetchone()[0],0)
+    def test_default_worker_count_is_one(self):
+        # Extra readers thrash the library's single spinning disk: measured
+        # 134 pages/s at one worker vs 75 at three.
+        import index_pdf_text
+        self.assertEqual(index_pdf_text.DEFAULT_WORKERS,1)
+        args=index_pdf_text.build_parser().parse_args(['--library','l','--db','d'])
+        self.assertEqual(args.workers,1)
+        self.assertEqual(args.batch_mb,index_pdf_text.BATCH_MB)
     def client(self):
         import app
         from fastapi.testclient import TestClient

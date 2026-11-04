@@ -966,7 +966,7 @@ def external_index_running() -> bool:
     return False
 
 
-def _run_index(rebuild: bool, workers: int = 3) -> None:
+def _run_index(rebuild: bool, workers: int = 1) -> None:
     rc = -1
     try:
         # Keep the indexer from starving the web app: the library is on a
@@ -1002,7 +1002,7 @@ def _run_index(rebuild: bool, workers: int = 3) -> None:
 
 
 @app.post('/api/index/build')
-def api_index_build(rebuild: int = 0, workers: int = 3):
+def api_index_build(rebuild: int = 0, workers: int = 1):
     """Extract PDF text into the search index, in the background."""
     with _index_lock:
         if _index_state['running'] or external_index_running():

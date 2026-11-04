@@ -366,7 +366,7 @@ From a terminal (note the idle I/O priority — see below):
 ```sh
 cd /mnt/disk5/rpg-app
 ionice -c2 -n7 nice -n 19 ./.venv/bin/python index_pdf_text.py \
-    --library /mnt/disk5/RPG-Library --db library.db --workers 3
+    --library /mnt/disk5/RPG-Library --db library.db --workers 1
 ```
 
 Measured on this machine, full rebuild of the restructured library
@@ -382,32 +382,71 @@ Measured on this machine, full rebuild of the restructured library
 | Hard failures | **2** — both pre-existing zero-byte PDFs in the source export |
 | Stale rows pruned | 4,896 (correctly removed after the restructure renamed every path) |
 
-A full rebuild takes an hour-plus because every PDF must be re-extracted; an
-incremental run only touches files whose mtime changed.
+That run used the old default of 3 workers, which is the thing to change: see
+*Why one worker* below — one worker is ~1.8× faster, so the same rebuild
+should take **~40 min**, not 72.
 
-Writes are batched by volume (about 12 MB of page text, or 200 files, per
-transaction — `--batch-mb` tunes it) and, **during a rebuild only**, the
-connection runs with `journal_mode=MEMORY`, `synchronous=OFF` and a 64 MB
-cache. The index is rebuildable, so giving up crash durability for the length
-of a rebuild is safe: an interruption loses at most the batch in flight, and
-the next run resumes from the last commit because finished files are already
-recorded in `pdf_status`. The previous pragmas are restored afterwards, so the
-live catalogue keeps its normal WAL durability; incremental runs never turn
-durability off.
+A full rebuild takes tens of minutes because every PDF must be re-extracted;
+an incremental run only touches files whose mtime changed.
 
-### Why only 3 workers, and why `ionice`
+### Where the 72 minutes actually went
+
+The index is written to `library.db`, which lives on the NVMe system disk,
+while the PDFs live on the spinning data disk — so reads and writes do not
+compete. Measured cost of each part, for an index the size of the real one
+(309,790 pages, 1.25 GB of text):
+
+| Stage | Cost | Share of a 72-min run |
+|---|---|---|
+| Reading and extracting the PDFs (3 workers) | ~69 min | **~96%** |
+| Writing every page into `pdf_fts` | ~35 s | 0.8% |
+| Trailing `INSERT INTO pdf_fts(pdf_fts) VALUES('optimize')` | ~5 s | 0.1% |
+| Pruning stale rows | ~0.4 s | — |
+
+So batching and durability pragmas were never the lever — they are worth under
+a minute in total. The PDF reads are, and on a single spinning disk that means
+the **worker count**, not the write path.
+
+Writes are nevertheless batched by volume (about 12 MB of page text, or 200
+files, per transaction — `--batch-mb` tunes it), and **during a rebuild only**
+the connection runs with a 64 MB cache and `synchronous=NORMAL`. Both are
+per-connection settings that disappear when the indexer exits, so an
+interruption loses at most the batch in flight and the next run resumes from
+the last commit, since finished files are already recorded in `pdf_status`.
+`NORMAL` in WAL mode cannot corrupt the database — it can only lose the last
+commits to a power cut, which the next run redoes — and it costs ~2 s less
+than the default across a whole rebuild.
+
+`journal_mode` is deliberately left alone: it is stored in the database file,
+so a rebuild killed while it was in `MEMORY` would leave the live catalogue
+crash-unsafe for the web app. Incremental runs never change any of this.
+
+### Why one worker, and why `ionice`
 
 The library sits on a **single spinning disk** (WD Caviar Black, 120 MB/s
-sequential). Parallel PDF reads are effectively random access, so many workers
-cause seek thrashing rather than speedup.
+sequential). Parallel PDF reads are effectively random access, so extra
+workers cause seek thrashing rather than speedup.
 
-This is not theoretical: at 8 workers the web app was observed stuck in
+Measured on the real library — 200 PDFs, cold, the same files each time with
+the page cache dropped before every read:
+
+| Workers | Time | Throughput |
+|---|---|---|
+| **1** | **78 s** | **134 pages/s** |
+| 2 | 113 s | 93 pages/s |
+| 3 | 141 s | 75 pages/s |
+
+One worker is the default for that reason, and it also explains the old
+72-minute run: at three workers the extraction ceiling is ~75 pages/s, and the
+run achieved 73.
+
+This is not theoretical either: at 8 workers the web app was observed stuck in
 uninterruptible disk sleep (`State: D`, `wchan: read_extent_buffer_pages`),
 unable to serve a single request, purely because the indexer had saturated the
 disk queue.
 
 The app therefore launches the indexer as
-`ionice -c2 -n7 nice -n 19 ... --workers 3`: best-effort I/O at the lowest
+`ionice -c2 -n7 nice -n 19 ... --workers 1`: best-effort I/O at the lowest
 priority, so heavy reads yield to interactive traffic but still get scheduled.
 Indexing takes longer than an unconstrained run but the library stays
 responsive throughout.
@@ -583,7 +622,7 @@ safe to delete at any time.
 | `GET /api/dtrpg/status` | sync job state + log tail |
 | `POST /api/dtrpg/sync?dry_run=0&dedupe=1&merge=1&rescan=1` | start DriveThruRPG sync |
 | `GET /api/index/status` | PDF index progress |
-| `POST /api/index/build?rebuild=0&workers=3` | start PDF text indexing |
+| `POST /api/index/build?rebuild=0&workers=1` | start PDF text indexing (one worker: more thrashes the disk) |
 | `POST /api/rescan` | rebuild the catalog |
 | `GET /thumb/{fid}?w=320\|1600` | cached downscaled image (see file lists) |
 | `GET /cover/{cid}` | cached shelf cover for a collection |

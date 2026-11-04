@@ -15,12 +15,18 @@ Runs the extraction across a process pool; only the parent writes to SQLite.
 The parent buffers page text and writes it with `executemany` in transactions
 sized by volume (about 12 MB of text, or 200 files, per commit), so a rebuild
 costs one commit per few hundred files instead of one per 40 files, and one
-statement per *batch* instead of two per page. During `--rebuild` the
-connection also switches to `journal_mode=MEMORY`, `synchronous=OFF` and a
-larger cache: the index is rebuildable, so crash durability is not worth
-paying for while it is being rebuilt. The previous pragmas are put back
-afterwards (`journal_mode` is persistent, so leaving it in MEMORY would make
-ordinary writes to the live catalogue crash-unsafe).
+statement per *batch* instead of two per page.
+
+Writing is not what makes a rebuild slow. Measured against a full-size index
+(309,790 pages, 1.25 GB of text): writing every page costs about 35 s and the
+terminating FTS `optimize` about 5 s, against roughly 70 min of reading PDFs
+off the disk. So `--rebuild` only relaxes *per-connection* settings — a 64 MB
+cache and `synchronous=NORMAL`, both of which disappear when the connection
+closes. That is safe in WAL mode: it can lose the last few commits to a power
+cut (they are redone next run) but cannot corrupt the file, which also holds
+the catalogue. `journal_mode` is deliberately left alone: it is stored in the
+database file, so switching it to MEMORY and being killed before switching
+back would leave the live catalogue crash-unsafe for the web app.
 
 Re-running is cheap: files whose mtime is unchanged are skipped unless
 --rebuild is given. Every commit is a resume point, so an interrupted run
@@ -28,16 +34,25 @@ leaves a consistent index that the next run continues from — Ctrl-C flushes th
 open batch first, and killing the process outright only loses the batch that
 had not been committed yet.
 
-IMPORTANT: the library lives on a single spinning disk. Many parallel workers
-cause seek thrashing that starves everything else on the machine (the web app
-has been observed stuck in uninterruptible disk sleep because of it). Keep
---workers low (2-4) and run under `ionice -c2 -n7` / `nice -n 19`, as the web
-app does. Do NOT use `ionice -c3` (idle): on mq-deadline it is effectively
-starved and runs ~25x slower.
+IMPORTANT: the library lives on a single spinning disk, and parallel PDF reads
+are effectively random access, so extra workers thrash the disk instead of
+going faster. Measured on the real library — 200 PDFs, cold, the same files
+each time with the page cache evicted before every read:
+
+    --workers 1    78 s   134 pages/s
+    --workers 2   113 s    93 pages/s
+    --workers 3   141 s    75 pages/s
+
+One worker is therefore the default: on this disk it is ~1.8x faster than
+three and far gentler on everything else using the disk (the web app has been
+observed stuck in uninterruptible disk sleep when the indexer saturated it).
+Raise --workers only if the library is on SSD. Run under `ionice -c2 -n7` /
+`nice -n 19`, as the web app does. Do NOT use `ionice -c3` (idle): on
+mq-deadline it is effectively starved and runs ~25x slower.
 
 Usage:
   ionice -c2 -n7 nice -n 19 python3 index_pdf_text.py \
-      --library /mnt/disk5/RPG-Library --db library.db [--workers 3]
+      --library /mnt/disk5/RPG-Library --db library.db [--workers 1]
       [--rebuild] [--limit N] [--batch-mb 12]
 """
 import argparse
@@ -54,6 +69,10 @@ MAX_PAGE_CHARS = 200_000
 BATCH_MB = 12
 BATCH_FILES = 200
 BULK_CACHE_MB = 64
+# One worker: on the library's spinning disk extra readers thrash instead of
+# helping (measured 134 pages/s at 1 worker vs 75 at 3 — see the module
+# docstring). Only raise this for a library on SSD.
+DEFAULT_WORKERS = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pdf_status (
@@ -183,69 +202,46 @@ class IndexWriter:
 
 
 def tune_for_bulk(con):
-    """Rebuild-only pragmas; returns the previous settings so they can be undone.
+    """Rebuild-only pragmas for *this connection*.
 
-    Only for `--rebuild`: the index is rebuildable, so losing the open
-    transaction to a crash is acceptable while it is being rebuilt, and not
-    paying for durability is most of the win. An incremental run keeps the
-    catalogue's normal (WAL) durability.
+    Both settings are per-connection and vanish when the connection closes, so
+    nothing weaker can leak into the live catalogue. `journal_mode` is
+    deliberately not touched: it is persistent in the database file, and a
+    rebuild killed between switching it to MEMORY and switching it back would
+    leave the web app writing to a crash-unsafe database.
+
+    `synchronous=NORMAL` rather than `OFF`: in WAL mode NORMAL cannot corrupt
+    the database (it can only lose the last transactions after a power cut,
+    which for a rebuild just means redoing them), while `OFF` can corrupt it —
+    and this file also holds the catalogue. Measured over 60,000 pages the
+    difference is 6.0 s vs 5.7 s, about 2 s across a whole rebuild, so there
+    is nothing to buy by taking that risk.
     """
-    prior = {
-        'journal_mode': con.execute('PRAGMA journal_mode').fetchone()[0],
-        'synchronous': con.execute('PRAGMA synchronous').fetchone()[0],
-        'cache_size': con.execute('PRAGMA cache_size').fetchone()[0],
-    }
-    mode = prior['journal_mode']
-    try:
-        mode = con.execute('PRAGMA journal_mode = MEMORY').fetchone()[0]
-    except sqlite3.OperationalError as exc:
-        # The web app holds the database open in WAL mode and SQLite will not
-        # switch a database that another connection is using.
-        print(f"  note: kept journal_mode={mode} ({exc})")
-    con.execute('PRAGMA synchronous = OFF')
+    con.execute('PRAGMA synchronous = NORMAL')
     con.execute(f'PRAGMA cache_size = -{BULK_CACHE_MB * 1024}')
-    print(f"rebuild pragmas : journal_mode={mode} synchronous=OFF "
-          f"cache={BULK_CACHE_MB}MB")
-    return prior
+    print(f"rebuild pragmas : journal_mode="
+          f"{con.execute('PRAGMA journal_mode').fetchone()[0]} "
+          f"synchronous=NORMAL cache={BULK_CACHE_MB}MB")
 
 
-def restore_pragmas(con, prior):
-    """Put back what tune_for_bulk() changed, so the live catalogue is safe."""
-    con.execute(f"PRAGMA cache_size = {prior['cache_size']}")
-    con.execute(f"PRAGMA synchronous = {prior['synchronous']}")
-    want = prior['journal_mode'].lower()
-    if con.execute('PRAGMA journal_mode').fetchone()[0].lower() == want:
-        return
-    # Leaving a live catalogue in journal_mode=MEMORY would make ordinary
-    # writes crash-unsafe, so retry briefly in case the web app happens to be
-    # mid-transaction, then say so loudly rather than failing silently.
-    for attempt in range(5):
-        try:
-            con.execute(f'PRAGMA journal_mode = {want}')
-        except sqlite3.OperationalError:
-            pass
-        else:
-            if con.execute('PRAGMA journal_mode').fetchone()[0].lower() == want:
-                return
-        if attempt < 4:
-            time.sleep(1)
-    print(f"  WARNING: could not restore journal_mode={want}; run "
-          f"`PRAGMA journal_mode={want};` on the catalogue once the app is "
-          f"idle (a MEMORY journal is not crash-safe)", flush=True)
-
-
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument('--library', required=True)
     ap.add_argument('--db', required=True)
-    ap.add_argument('--workers', type=int, default=3)
+    ap.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
+                    help=f'extraction processes (default {DEFAULT_WORKERS}: '
+                         f'more than one thrashes the library disk)')
     ap.add_argument('--rebuild', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--batch-mb', type=float, default=BATCH_MB,
                     help=f'commit once this much page text is buffered '
                          f'(default {BATCH_MB}); lower loses less work to a '
                          f'kill, higher writes faster')
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     library = os.path.abspath(args.library)
     con = ensure_schema(sqlite3.connect(args.db, timeout=60))
@@ -285,10 +281,9 @@ def main():
     processed = skipped = failed = 0
     chars_total = 0
     interrupted = False
-    prior = None
     try:
         if args.rebuild:
-            prior = tune_for_bulk(con)
+            tune_for_bulk(con)
         try:
             with Pool(args.workers) as pool:
                 for n, res in enumerate(
@@ -318,8 +313,6 @@ def main():
                   "resumes", flush=True)
     finally:
         writer.flush()
-        if prior is not None:
-            restore_pragmas(con, prior)
 
     el = time.time() - t0
     idx = con.execute('SELECT COUNT(*) FROM pdf_status').fetchone()[0]
