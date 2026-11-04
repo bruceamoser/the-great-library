@@ -1,0 +1,6 @@
+<article class="volume">
+<a class="volume-cover" href="{{ browse_url(request,'/collection/' ~ c['id']) }}" aria-label="Explore {{ c['name'] }}">
+<span class="cover-fallback" aria-hidden="true"><span>✧</span>{{ c['name'] }}</span>
+<img src="/cover/{{ c['id'] }}?v={{ cover_v() }}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true">
+</a><div class="volume-caption"><a href="{{ browse_url(request,'/collection/' ~ c['id']) }}">{{ c['name'] }}</a><span>{{ c['publisher'] or c['family'] or 'From the collection' }}</span></div>
+</article>

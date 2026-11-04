@@ -1,0 +1,23 @@
+{# Action buttons for one file in a list.
+   Needs `f` in context (id, ext, filename).
+   The mapping comes from media_of() in app.py, the same one that drives /view,
+   so a file is never previewable in one place and not the other. #}
+{%- set m = media(f['ext']) -%}
+<span class="factions">
+{%- if m == 'pdf' %}
+  <a class="mini" href="{{ browse_url(request,'/view/' ~ f['id']) }}" target="_blank" rel="noopener"
+     title="Open the PDF in a new tab">open</a>
+{%- elif m in modal_media %}
+  <button class="mini" type="button" data-media="{{ m }}"
+          data-url="{% if m == 'image' %}/thumb/{{ f['id'] }}?w=1600&amp;v={{ f['mtime']|int }}{% else %}/raw/{{ f['id'] }}{% endif %}"
+          data-raw="/raw/{{ f['id'] }}"
+          data-name="{{ f['filename'] }}"
+          title="{% if m == 'image' %}Preview the image{% else %}Play this {{ m }}{% endif %}"
+    >{% if m == 'image' %}view{% else %}play{% endif %}</button>
+{%- else %}
+  <a class="mini" href="/raw/{{ f['id'] }}" target="_blank" rel="noopener"
+     title="Open the raw file">open</a>
+{%- endif %}
+  <a class="mini" href="/raw/{{ f['id'] }}?download=1"
+     title="Download this file">↓</a>
+</span>

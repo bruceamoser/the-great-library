@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block title %}The Keeper’s Office — The Great Library{% endblock %}
+{% block content %}
+
+<section class="page-heading"><p class="eyebrow">Behind the shelves</p><h1>The Keeper’s Office</h1><p>Care for the collection. Keep every world within reach.</p></section><p class="meta">Maintenance controls are available on the library host. Browsing remains open to your LAN.</p><div id="maintenance-overview" class="maintenance-overview"></div><pre id="job-overview" class="synclog" aria-label="Background job status"></pre>
+<p><a class="quiet-button" href="/classification">Review collection shelves →</a></p><p><a class="quiet-button" href="/explore">Explore file-level classification →</a></p><p><a class="gold-button" href="/inbox">Open the arrivals inbox →</a></p><h3>DriveThruRPG library</h3>
+<p class="meta">
+  Downloads your DriveThruRPG purchases, then <b>de-duplicates</b> them
+  (keeping the curated shelf copy wherever new items duplicate what you already
+  had), <b>folds them into the library shelves</b> so they sit alongside related
+  material, and rebuilds the catalog. DriveThruRPG is recorded as a source,
+  not kept as a separate shelf. Only new and changed files are fetched after
+  the first run.
+</p>
+
+{% if not token_present %}
+<div class="warn">
+  <b>No Library App Key found.</b>
+  <ol>
+    <li>Open <a href="https://www.drivethrurpg.com/en/account/settings" target="_blank"
+        rel="noopener">your DriveThruRPG account settings</a>.</li>
+    <li>Under <b>Library App Keys</b>, generate a new key and copy it.</li>
+    <li>Save it on this machine (not on the Samba share):</li>
+  </ol>
+  <pre class="synclog">mkdir -p ~/.config/drpg
+printf '%s' 'YOUR_KEY' &gt; {{ token_file }}
+chmod 600 {{ token_file }}</pre>
+</div>
+{% else %}
+<p class="meta">✓ Library App Key found at <code>{{ token_file }}</code></p>
+{% endif %}
+
+<div class="chips">
+  <button id="btnSync" type="button">Sync now</button>
+  <button id="btnDry" type="button">Dry run (download nothing)</button>
+  <button id="btnRescan" type="button">Rebuild catalog</button>
+</div>
+
+<p class="meta" id="state">idle</p>
+<pre id="log" class="synclog"></pre>
+
+<h3>Search inside PDFs</h3>
+<p class="meta">
+  Extracts the text layer from every PDF so search finds words <em>inside</em>
+  books, not just filenames. About 5% of PDFs are image-only scans and remain
+  unsearchable without OCR. Re-running only processes new or changed files.
+</p>
+<div class="chips">
+  <button id="btnIndex" type="button">Build / update index</button>
+  <button id="btnIndexRebuild" type="button">Full rebuild</button>
+</div>
+<p class="meta" id="indexstate">…</p>
+<pre id="indexlog" class="synclog"></pre>
+
+<h3>Restart</h3>
+<p class="meta">
+  Picks up code changes without any <code>sudo</code>. The app exits and its
+  supervisor (systemd's <code>Restart=on-failure</code>, or the relaunch loop in
+  <code>manage.sh</code>) brings it straight back.
+</p>
+<div class="chips">
+  <button id="btnRestart" type="button">Restart app</button>
+</div>
+<p class="meta" id="restartstate"></p>
+
+<script>
+const logEl = document.getElementById('log');
+const stateEl = document.getElementById('state');
+const btnSync = document.getElementById('btnSync');
+const btnDry = document.getElementById('btnDry');
+
+function fmt(n){ return n ? new Date(n * 1000).toLocaleTimeString() : '—'; }
+
+async function poll(){
+  try{
+    const s = await (await fetch('/api/dtrpg/status')).json();
+    if (s.running){
+      stateEl.textContent = 'running since ' + fmt(s.started) +
+        (s.dry_run ? ' (dry run)' : '') + ' — downloaded files on disk: ' + s.downloaded_files;
+    } else if (s.finished){
+      stateEl.textContent = 'finished at ' + fmt(s.finished) +
+        ' — exit code ' + s.returncode +
+        ' — files on disk: ' + s.downloaded_files;
+    } else {
+      stateEl.textContent = 'idle — files on disk: ' + s.downloaded_files;
+    }
+    if (s.tail){ logEl.textContent = s.tail; logEl.scrollTop = logEl.scrollHeight; }
+    btnSync.disabled = s.running;
+    btnDry.disabled = s.running;
+  }catch(e){ stateEl.textContent = 'status unavailable: ' + e; }
+}
+
+async function start(dry){
+  const r = await fetch('/api/dtrpg/sync?dry_run=' + (dry?1:0), {method:'POST'});
+  const j = await r.json();
+  if (!j.ok) alert(j.error);
+  poll();
+}
+
+btnSync.onclick = () => start(false);
+btnDry.onclick = () => start(true);
+document.getElementById('btnRescan').onclick = async () => {
+  const response=await fetch('/api/rescan', {method:'POST'});
+  const result=await response.json();
+  if(!response.ok) alert(result.error||'Rescan failed');
+  alert('Catalog rebuilt.');
+};
+
+setInterval(poll, 2000);
+poll();
+
+// ---- pdf content index -------------------------------------------------
+const indexLogEl = document.getElementById('indexlog');
+const indexStateEl = document.getElementById('indexstate');
+const btnIndex = document.getElementById('btnIndex');
+const btnIndexRebuild = document.getElementById('btnIndexRebuild');
+
+async function pollIndex(){
+  try{
+    const s = await (await fetch('/api/index/status')).json();
+    const pct = s.total_pdfs ? (100 * s.indexed_files / s.total_pdfs).toFixed(1) : '0';
+    indexStateEl.textContent =
+      (s.running
+        ? (s.started ? 'indexing since ' + fmt(s.started)
+                     : 'indexing (started outside the web UI)')
+        : (s.finished ? 'last run finished ' + fmt(s.finished) + ' (exit ' + s.returncode + ')'
+                      : 'idle')) +
+      ' — ' + s.indexed_files.toLocaleString() + '/' + s.total_pdfs.toLocaleString() +
+      ' PDFs (' + pct + '%), ' + s.indexed_pages.toLocaleString() + ' pages, ' +
+      (s.indexed_chars/1e6).toFixed(1) + 'M chars';
+    if (s.tail){ indexLogEl.textContent = s.tail; indexLogEl.scrollTop = indexLogEl.scrollHeight; }
+    btnIndex.disabled = s.running;
+    btnIndexRebuild.disabled = s.running;
+  }catch(e){ indexStateEl.textContent = 'status unavailable: ' + e; }
+}
+
+async function startIndex(rebuild){
+  const r = await fetch('/api/index/build?rebuild=' + (rebuild?1:0), {method:'POST'});
+  const j = await r.json();
+  if (!j.ok) alert(j.error);
+  pollIndex();
+}
+btnIndex.onclick = () => startIndex(false);
+btnIndexRebuild.onclick = () => startIndex(true);
+setInterval(pollIndex, 3000);
+pollIndex();
+
+// ---- self restart (no sudo) --------------------------------------------
+document.getElementById('btnRestart').onclick = async () => {
+  if (!confirm('Restart the web app now? The page will reload in a few seconds.')) return;
+  const el = document.getElementById('restartstate');
+  el.textContent = 'restarting…';
+  try {
+    const j = await (await fetch('/api/restart?confirm=1', {method:'POST'})).json();
+    el.textContent = j.ok ? ('restarting via ' + j.supervisor + '…') : ('error: ' + j.error);
+  } catch (e) {
+    el.textContent = 'restarting…';
+  }
+  setTimeout(() => location.reload(), 7000);
+};
+</script>
+
+<script>async function overview(){try{const d=await (await fetch('/api/maintenance')).json();const target=document.getElementById('maintenance-overview');target.replaceChildren();for(const [label,count] of [['Collections needing system metadata',d.missing_metadata],['PDFs with no extracted text',d.needs_ocr],['Empty collections to review',d.empty_collections]]){const card=document.createElement('div'),b=document.createElement('b'),s=document.createElement('span');b.textContent=count;s.textContent=label;card.append(b,s);target.append(card);}document.getElementById('job-overview').textContent=Object.entries(d.jobs).map(([name,j])=>name+': '+(j.running?'running':j.error?j.error:j.finished?'finished (exit '+j.returncode+')':'not run yet')+(j.completed?' · '+j.completed+' / '+j.total:'')+(j.failed?' · '+j.failed+' failed':'')).join('\n');}catch{}}overview();setInterval(overview,10000);</script>{% endblock %}

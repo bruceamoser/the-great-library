@@ -1,0 +1,17 @@
+[Unit]
+Description=RPG Library web app (LAN-only)
+After=network.target
+
+[Service]
+Type=simple
+User=bruce
+Group=bruce
+WorkingDirectory=/mnt/disk5/rpg-app
+Environment=RPG_LIBRARY=/mnt/disk5/RPG-Library
+Environment=RPG_DB=/mnt/disk5/rpg-app/library.db
+ExecStart=/mnt/disk5/rpg-app/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

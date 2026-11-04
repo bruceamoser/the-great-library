@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Search — The Great Library{% endblock %}
+{% block content %}
+
+<section class="page-heading"><p class="eyebrow">{{ 'The Cartographer’s Room' if cat=='asset' else 'The Library Catalog' }}</p><h1>{{ 'Atlas & Art' if cat=='asset' else 'Seek, and discover' }}</h1><p>{{ 'Maps, tokens, soundscapes, and the makings of a world.' if cat=='asset' else 'Search the shelves, or follow a phrase into the pages.' }}</p></section>
+<form class="filters" action="/search" method="get">
+  <input type="search" name="q" value="{{ q }}" placeholder="A title, a world, a phrase…" aria-label="Search query">
+  <select aria-label="Filter" name="cat">
+    <option value="">books + assets</option>
+    {% for c in cats %}
+    <option value="{{ c }}" {{ 'selected' if c==cat else '' }}>{{ c }}s</option>
+    {% endfor %}
+  </select>
+  <select aria-label="Filter" name="subcat">
+    <option value="">any type</option>
+    {% for c, subs in subcats.items() %}
+      {% for s in subs %}
+    <option value="{{ s }}" {{ 'selected' if s==subcat else '' }}>{{ s }}</option>
+      {% endfor %}
+    {% endfor %}
+  </select>
+  <select aria-label="Filter" name="shelf">
+    <option value="">any shelf</option>
+    {% for s in shelves %}
+    <option value="{{ s['shelf'] }}" {{ 'selected' if s['shelf']==shelf else '' }}>
+      {{ shelf_label(s['shelf']) }}</option>
+    {% endfor %}
+  </select>
+  <select aria-label="Filter" name="tag">
+    <option value="">any tag</option>
+    {% for t in all_tags %}
+    <option value="{{ t['name'] }}" {{ 'selected' if t['name']==tag else '' }}>
+      {{ t['name'] }}</option>
+    {% endfor %}
+  </select>
+  <input type="hidden" name="section" value="{{ section }}">
+  <select name="sort" aria-label="Sort results"><option value="title" {{ 'selected' if sort=='title' else '' }}>Title A–Z</option><option value="size" {{ 'selected' if sort=='size' else '' }}>Largest first</option></select>
+  <button type="submit">Search the library</button>
+</form>
+
+<p><a class="quiet-button" href="{{ browse_url(request,'/explore?q=' ~ q|urlencode) }}">Explore systems, editions, series &amp; resources →</a></p><nav class="result-tabs" aria-label="Result type">{% for value,label in [('collections','Collections'),('files','Books & assets'),('content','Inside books'),('campaigns','Campaigns')] %}<a class="{{ 'active' if section==value else '' }}" href="{{ result_url(section=value,page=1) }}">{{ label }} <span>{{ '{:,}'.format(totals[value]) }}</span></a>{% endfor %}</nav>
+{% if q %}<p class="search-summary">Results for “{{ q }}”</p>{% endif %}
+{% if not index_available %}<p class="warn">Inside-book search is not indexed yet. Build the index in the Keeper’s Office.</p>{% endif %}
+{% if campaigns %}{% include '_campaign_cards.html' %}{% endif %}
+{% if collections %}
+<h3>Collections ({{ collections|length }})</h3>
+<div class="volumes search-volumes">{% for c in collections %}{% include '_book.html' %}{% endfor %}</div>
+{% endif %}
+
+{% if files and cat=='asset' %}<div class="asset-gallery">{% for f in files %}{% set m=media(f['ext']) %}<article class="asset-card"><a class="asset-image" href="{{ browse_url(request,'/view/' ~ f['id']) }}">{% if m in ('image','pdf') %}<img src="/thumb/{{ f['id'] }}?w=320&amp;v={{ f['mtime']|int }}" alt="{{ f['filename'] }}" loading="lazy" onerror="this.style.visibility='hidden'">{% else %}<span>{{ media_icon(f['ext']) }}</span>{% endif %}</a><div><h3><a href="{{ browse_url(request,'/view/' ~ f['id']) }}">{{ f['filename'] }}</a></h3><p><a href="{{ browse_url(request,'/collection/' ~ f['collection_id']) }}">{{ f['collection_name'] }}</a> · {{ f['size']|filesize }}</p>{% include '_fileactions.html' %}</div></article>{% endfor %}</div>{% elif files %}
+<h3>Files ({{ files|length }})</h3>
+<div class="table-scroll"><table class="filelist">
+  <tr>
+    <th class="thumbcell"></th>
+    <th>File</th><th>Collection</th><th>Type</th>
+    <th class="num">Size</th><th>Actions</th>
+  </tr>
+  {% for f in files %}
+  {% set m = media(f['ext']) %}
+  <tr>
+    <td class="thumbcell">
+      {% if m in ('image', 'pdf') %}
+      <img class="rowthumb" src="/thumb/{{ f['id'] }}?w=160&amp;v={{ f['mtime']|int }}" alt="" loading="lazy"
+           decoding="async" onerror="this.style.visibility='hidden'">
+      {% else %}
+      <span class="rowicon">{{ media_icon(f['ext']) }}</span>
+      {% endif %}
+    </td>
+    <td class="fname{% if m == 'image' %} has-preview{% endif %}"
+        {%- if m == 'image' %} data-preview="/thumb/{{ f['id'] }}?w=320&amp;v={{ f['mtime']|int }}"
+        data-preview-name="{{ f['filename'] }}"{% endif %}>
+      <a href="{{ browse_url(request,'/view/' ~ f['id']) }}"{% if m == 'pdf' %} target="_blank" rel="noopener"{% endif %}>{{ f['filename'] }}</a>
+    </td>
+    <td><a href="{{ browse_url(request,'/collection/' ~ f['collection_id']) }}">{{ f['collection_name'] }}</a></td>
+    <td>{{ f['kind'] }}</td>
+    <td class="num">{{ f['size']|filesize }}</td>
+    <td class="acts">{% include '_fileactions.html' %}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+
+{% if content_hits %}
+<h3>Inside documents <span class="muted">({{ content_hits|length }} pages)</span></h3>
+<table class="filelist contenthits">
+  {% for h in content_hits %}
+  <tr>
+    <td>
+      <div class="hitfile">
+        <a href="{{ browse_url(request,'/view/' ~ h['fid'] ~ '?page=' ~ h['page']) }}">{{ h['filename'] }}</a>
+        <span class="muted"> — page {{ h['page'] }}</span>
+      </div>
+      <div class="snip">{{ highlight(h['snip'])|safe }}</div>
+      <div class="muted smalltxt">
+        <a href="{{ browse_url(request,'/collection/' ~ h['cid']) }}">{{ h['collection_name'] }}</a>
+        · {{ shelf_label(h['shelf']) }}
+      </div>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if mode and not collections and not files and not content_hits and not campaigns %}
+<p class="muted">Nothing found.</p>
+{% endif %}
+
+<nav class="pagination" aria-label="Results pages">{% if page>1 %}<a class="quiet-button" href="{{ result_url(page=page-1) }}">← Previous</a>{% endif %}<span>Page {{ page }} of {{ pages }} · {{ '{:,}'.format(totals[section]) }} results</span>{% if page<pages %}<a class="gold-button" href="{{ result_url(page=page+1) }}">Next page →</a>{% endif %}</nav>
+{% endblock %}

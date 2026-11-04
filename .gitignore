@@ -1,0 +1,27 @@
+# ---- Library data: not part of this repository -------------------------
+# The catalogue, caches, imported originals and provenance describe the
+# book collection on the host, not the application.
+library.db
+library.db-*
+*.sqlite3
+covers/
+thumbnails/
+inbox-originals/
+provenance.json
+provenance.json.bak-flat
+job-*.json
+*.log
+*.lock
+
+# ---- Python ------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- Local tooling / OS ------------------------------------------------
+.openbad/
+.DS_Store
+*.swp

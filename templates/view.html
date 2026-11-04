@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ f['filename'] }} — The Great Library{% endblock %}
+{% block content %}
+
+<p class="crumbs">
+  <a href="{{ browse_url(request,'/collection/' ~ f['cid']) }}">{{ f['collection_name'] }}</a>
+  / {{ f['filename'] }}
+</p>
+
+<h2>{{ f['filename'] }}</h2>
+<p class="meta">
+  {{ f['kind'] }} · {{ f['size']|filesize }}
+  <a class="btn" href="/raw/{{ f['id'] }}" target="_blank">open raw</a>
+  <a class="btn" href="/raw/{{ f['id'] }}?download=1">download</a>
+</p>
+
+{% set classification=book_details(f['id']) %}{% if classification %}{% include '_book_classification.html' %}{% endif %}
+{% if mode == 'pdf' %}
+  <div id="pdfroot" data-url="/raw/{{ f['id'] }}" data-page="{{ page }}" data-path="{{ f['rel_path'] }}" data-name="{{ f['filename'] }}" data-id="{{ f['id'] }}">
+    <div class="pdftoolbar">
+      <button id="pdfprev" type="button">‹ prev</button>
+      <input id="pdfpage" aria-label="Page number" type="number" min="1" value="1">
+      <span class="muted">/ <span id="pdfcount">?</span></span>
+      <button id="pdfnext" type="button">next ›</button>
+      <span class="spacer"></span><button id="pdfbookmark" type="button">☆ Bookmark</button>
+      <button id="pdfzout" type="button">−</button>
+      <button id="pdfzin" type="button">+</button>
+      <button id="pdffit" type="button">fit width</button>
+      <span id="pdfstatus" class="muted"></span>
+    </div>
+    <div class="pdfstage"><canvas id="pdfcanvas"></canvas></div><details class="reader-notes"><summary>Your notes on this volume</summary><textarea id="book-notes" aria-label="Book notes" placeholder="A thought, a rule to remember, a seed of an adventure…"></textarea></details>
+  </div>
+  <script type="module" src="/static/pdfviewer.js?v={{ asset_v() }}"></script>
+{% elif mode == 'image' %}<p id="image-loading" role="status" class="meta">Preparing image preview…</p>{% if f['ext'] in ('.tif','.tiff') %}<p class="meta">Browser preview converted from TIFF. Download keeps the original full-resolution TIFF.</p>{% endif %}
+  <img class="viewer-img" onload="document.getElementById('image-loading').hidden=true" onerror="document.getElementById('image-loading').textContent='Preview unavailable or still preparing. You can download the original above.'" src="{{ '/thumb/' ~ f['id'] ~ '?w=1600' if f['ext'] in ('.tif','.tiff') else '/raw/' ~ f['id'] }}" alt="{{ f['filename'] }}">
+{% elif mode == 'audio' %}
+  <audio class="viewer-audio" src="/raw/{{ f['id'] }}" controls></audio>
+{% elif mode == 'video' %}
+  <video class="viewer-audio" src="/raw/{{ f['id'] }}" controls></video>
+{% elif mode == 'text' %}
+  <iframe class="viewer" src="/raw/{{ f['id'] }}"></iframe>
+{% else %}
+  <p class="muted">No inline preview for this file type — use “open raw”.</p>
+{% endif %}
+
+{% endblock %}

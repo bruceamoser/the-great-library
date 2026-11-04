@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#101b17"><title>{% block title %}The Great Library{% endblock %}</title>
+<link rel="stylesheet" href="/static/fonts/fonts.css?v={{ asset_v() }}"><link rel="stylesheet" href="/static/style.css?v={{ asset_v() }}"><link rel="stylesheet" href="/static/theme.css?v={{ asset_v() }}">
+<script src="/static/library.js?v={{ asset_v() }}" defer></script></head>
+<body><a class="skip-link" href="#main">Skip to content</a>
+<header class="library-header">
+<a class="brand" href="/" aria-label="The Great Library home"><svg viewBox="0 0 64 72" aria-hidden="true"><path d="M8 17 32 3l24 14v29L32 68 8 46Z M16 22l16-9 16 9v20L32 56 16 42Z"/><path d="M20 29q7-4 12 1 5-5 12-1v15q-7-4-12 1-5-5-12-1Z M32 30v15 M32 17v5 M27 20h10"/></svg><span>The Great Library<small>A sanctuary of worlds</small></span></a>
+<nav aria-label="Main navigation">
+<a href="/shelf" {{ 'aria-current=page' if request.url.path=='/shelf' else '' }}>The Stacks</a>
+<a href="/search?cat=asset&section=files" {{ 'aria-current=page' if request.query_params.get('cat')=='asset' else '' }}>Atlas &amp; Art</a>
+<a href="/explore">Explore the catalog</a>
+<a href="/inbox" {{ 'aria-current=page' if request.url.path=='/inbox' else '' }}>Inbox</a>
+<a href="/desk" {{ 'aria-current=page' if request.url.path=='/desk' else '' }}>Reading Desk</a>
+</nav>
+<form class="searchbox" action="/search" role="search"><label class="sr-only" for="global-search">Search the library</label><input id="global-search" type="search" name="q" placeholder="Seek a book, a world, a story…" value="{{ q|default('') }}"><button aria-label="Search">⌕</button></form>
+<a class="keeper-link" href="/dtrpg" title="Library maintenance" aria-label="Library maintenance">⚙</a>
+</header>
+<div id="search-progress" role="status" aria-live="polite" hidden><span class="search-spinner" aria-hidden="true"></span><span>Searching the library…</span><small>Searching inside books can take a little longer.</small><button id="cancel-search" type="button">Cancel</button></div><main id="main">{% if search_return(request) %}<a class="quiet-button search-return" href="{{ search_return(request) }}">← Back to search results</a>{% endif %}{% block content %}{% endblock %}</main>
+<footer><span class="footer-sigil">✧</span><span>THE GREAT LIBRARY</span><p>For the worlds you have visited. And those still waiting.</p><a href="/browse">Library catalog</a><span aria-hidden="true"> · </span><a href="/dtrpg">The Keeper’s Office</a></footer>
+<div id="mediamodal" class="mm" hidden><div class="mm-backdrop" data-close></div><div class="mm-panel" role="dialog" aria-modal="true" aria-labelledby="mmtitle"><div class="mm-head"><span class="mm-title" id="mmtitle"></span><span class="mm-tools"><a class="mini mm-open" href="#" target="_blank" rel="noopener">open raw</a><button class="mini mm-close" type="button" data-close>close ✕</button></span></div><div class="mm-stage"></div></div></div>
+<div id="hoverpeek" class="peek" hidden><img alt=""></div><div id="toast" role="status" hidden></div>
+<script src="/static/media.js?v={{ asset_v() }}" defer></script></body></html>

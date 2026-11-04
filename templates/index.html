@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}RPG Library{% endblock %}
+{% block content %}
+
+<section class="page-heading"><p class="eyebrow">The complete collection</p><h1>The library catalog</h1><p>Every wing, every shelf, every world.</p></section><section class="stats">
+  <div class="stat"><b>{{ '{:,}'.format(n_files) }}</b><span>files</span></div>
+  <div class="stat"><b>{{ n_collections }}</b><span>collections</span></div>
+  <div class="stat"><b>{{ '%.1f'|format(n_bytes/1e9) }} GB</b><span>on disk</span></div>
+</section>
+
+<div class="viewswitch">
+  <a href="/shelf">Shelves</a>
+  <a class="active" href="/browse">Dashboard</a>
+  <a href="/search">Search</a>
+</div>
+
+<h2>Browse</h2>
+<div class="catgrid">
+{% for c in cats %}
+  {% if cat_tree.get(c) %}
+  <div class="catcard">
+    <a class="cathead" href="/search?cat={{ c }}">{{ category_label[c] }}</a>
+    <div class="chips">
+    {% for s in cat_tree[c] %}
+      <a class="chip" href="/search?subcat={{ s['sub'] }}">
+        {{ subcategory_label.get(s['sub'], s['sub']) }} <b>{{ '{:,}'.format(s['n']) }}</b>
+      </a>
+    {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+{% endfor %}
+</div>
+
+<h2>Shelves</h2>
+<div class="shelf-grid">
+{% for s in shelves %}
+  <a class="shelf-card" href="/search?shelf={{ s['shelf']|urlencode }}">
+    <b>{{ shelf_label(s['shelf']) }}</b>
+    <span>{{ s['n_collections'] }} games · {{ s['n_files'] }} files</span>
+    <span class="muted">{{ '%.1f'|format((s['n_bytes'] or 0)/1e9) }} GB</span>
+  </a>
+{% endfor %}
+</div>
+
+<h2>From the catalog</h2>
+<div class="chips">
+{% for r in recent %}
+  <a class="chip" href="{{ browse_url(request,'/collection/' ~ r['id']) }}">{{ r['name'] }} <b>{{ r['n_files'] }}</b></a>
+{% endfor %}
+</div>
+
+{% endblock %}

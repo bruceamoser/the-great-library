@@ -1,0 +1,1 @@
+<div class="campaign-grid">{% for c in campaigns %}<a class="campaign-card" href="{{ browse_url(request,c['url']) }}"><span class="eyebrow">{{ c['edition'] }}</span><h3>{{ c['name'] }}</h3><p>{{ c['sections'][0][1]|length }} book files · {{ c['sections'][1][1]|length }} maps · {{ c['sections'][2][1]|length }} extras</p><span>Open this adventure path →</span></a>{% endfor %}</div>
