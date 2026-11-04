@@ -35,6 +35,15 @@ class LibraryTests(unittest.TestCase):
         self.command(*args,'--rebuild');self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'ancient'"),[(0,)])
         self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'gryphon'"),[(1,)])
     def index_args(self,*extra):return (ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db,'--workers','1',*extra)
+    def test_default_worker_pool_indexes_everything(self):
+        # Runs the shipped default (three streaming workers, no --workers) so
+        # CI exercises a real pool, including 3.14's multiprocessing changes.
+        self.make_pdfs(6)
+        out=self.command(ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db)
+        self.assertIn('failed       : 0',out.stdout)
+        self.assertEqual(self.query('select count(*) from pdf_status'),[(7,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),[(7,)])
+        self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'indexable'"),[(6,)])
     def make_pdfs(self,count):
         import pymupdf
         for i in range(count):
@@ -118,14 +127,43 @@ class LibraryTests(unittest.TestCase):
         # The relaxed settings are per-connection, so a new one gets the defaults.
         with sqlite3.connect(self.db) as con:
             self.assertNotEqual(con.execute('pragma synchronous').fetchone()[0],0)
-    def test_default_worker_count_is_one(self):
-        # Extra readers thrash the library's single spinning disk: measured
-        # 134 pages/s at one worker vs 75 at three.
+    def test_open_pdf_streams_small_files_and_falls_back_to_path(self):
         import index_pdf_text
-        self.assertEqual(index_pdf_text.DEFAULT_WORKERS,1)
+        class Stub:
+            def __init__(self,fail_stream=False):self.calls=[];self.fail_stream=fail_stream
+            def open(self,*a,**kw):
+                if 'stream' in kw:
+                    self.calls.append(('stream',kw['filetype']))
+                    if self.fail_stream:raise RuntimeError('not a pdf')
+                else:self.calls.append(('path',a[0]))
+                return 'DOC'
+        small=self.folder/'Corebook.pdf'
+        stub=Stub();self.assertEqual(index_pdf_text.open_pdf(stub,small,1<<20),'DOC')
+        self.assertEqual(stub.calls,[('stream','pdf')])
+        stub=Stub();index_pdf_text.open_pdf(stub,small,1)          # above the cap
+        self.assertEqual(stub.calls,[('path',small)])
+        stub=Stub();index_pdf_text.open_pdf(stub,small,0)          # disabled
+        self.assertEqual(stub.calls,[('path',small)])
+        stub=Stub(fail_stream=True);index_pdf_text.open_pdf(stub,small,1<<20)
+        self.assertEqual(stub.calls,[('stream','pdf'),('path',small)])
+    def test_streamed_extraction_matches_reading_in_place(self):
+        import index_pdf_text
+        path=self.folder/'Corebook.pdf'
+        rel=str(path.relative_to(self.library))
+        streamed=index_pdf_text.extract((rel,str(path),1.0,1<<20))
+        in_place=index_pdf_text.extract((rel,str(path),1.0,0))
+        self.assertIsNone(streamed[5]);self.assertIsNone(in_place[5])
+        self.assertEqual(streamed[2:5],in_place[2:5])
+        self.assertIn('ancient dragon wisdom',''.join(t for _,t in streamed[4]))
+    def test_default_worker_count_is_three(self):
+        # Three workers, each streaming a whole file, was fastest on the real
+        # disk; both fewer and more were slower. See the module docstring.
+        import index_pdf_text
+        self.assertEqual(index_pdf_text.DEFAULT_WORKERS,3)
         args=index_pdf_text.build_parser().parse_args(['--library','l','--db','d'])
-        self.assertEqual(args.workers,1)
+        self.assertEqual(args.workers,3)
         self.assertEqual(args.batch_mb,index_pdf_text.BATCH_MB)
+        self.assertEqual(args.stream_max_mb,index_pdf_text.STREAM_MAX_MB)
     def client(self):
         import app
         from fastapi.testclient import TestClient

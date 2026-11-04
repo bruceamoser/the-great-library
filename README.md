@@ -366,7 +366,7 @@ From a terminal (note the idle I/O priority — see below):
 ```sh
 cd /mnt/disk5/rpg-app
 ionice -c2 -n7 nice -n 19 ./.venv/bin/python index_pdf_text.py \
-    --library /mnt/disk5/RPG-Library --db library.db --workers 1
+    --library /mnt/disk5/RPG-Library --db library.db --workers 3
 ```
 
 Measured on this machine, full rebuild of the restructured library
@@ -382,9 +382,11 @@ Measured on this machine, full rebuild of the restructured library
 | Hard failures | **2** — both pre-existing zero-byte PDFs in the source export |
 | Stale rows pruned | 4,896 (correctly removed after the restructure renamed every path) |
 
-That run used the old default of 3 workers, which is the thing to change: see
-*Why one worker* below — one worker is ~1.8× faster, so the same rebuild
-should take **~40 min**, not 72.
+That run used the old code, which let MuPDF read each PDF in its own scattered
+order. Reading each file as one sequential stream and parsing it from memory is
+~3.9× faster at the same worker count, so the same rebuild should take
+**~17–20 min** rather than 72. See *Why three workers, and why streamed reads*
+below.
 
 A full rebuild takes tens of minutes because every PDF must be re-extracted;
 an incremental run only touches files whose mtime changed.
@@ -404,8 +406,10 @@ compete. Measured cost of each part, for an index the size of the real one
 | Pruning stale rows | ~0.4 s | — |
 
 So batching and durability pragmas were never the lever — they are worth under
-a minute in total. The PDF reads are, and on a single spinning disk that means
-the **worker count**, not the write path.
+a minute in total. The PDF reads are, and the thing that was wrong with them
+was not the worker count but the **read pattern**: MuPDF walks each file's
+object graph, so its reads arrive scattered across the file, which on one
+spinning disk is a stream of seeks.
 
 Writes are nevertheless batched by volume (about 12 MB of page text, or 200
 files, per transaction — `--batch-mb` tunes it), and **during a rebuild only**
@@ -421,35 +425,51 @@ than the default across a whole rebuild.
 so a rebuild killed while it was in `MEMORY` would leave the live catalogue
 crash-unsafe for the web app. Incremental runs never change any of this.
 
-### Why one worker, and why `ionice`
+### Why three workers, and why streamed reads
 
 The library sits on a **single spinning disk** (WD Caviar Black, 120 MB/s
-sequential). Parallel PDF reads are effectively random access, so extra
-workers cause seek thrashing rather than speedup.
+sequential). MuPDF reads a PDF object by object, in an order that is not
+sequential on disk, so on a spinning disk each of those small reads can cost a
+seek. `index_pdf_text.py` therefore reads each whole file in one sequential
+pass and hands the bytes to MuPDF (`open_pdf()`); files larger than
+`--stream-max-mb` (default 256 MB, above the library's 99th percentile) are
+opened in place so worker memory stays bounded.
 
-Measured on the real library — 200 PDFs, cold, the same files each time with
-the page cache dropped before every read:
+Where the time goes depends on both the read pattern *and* the worker count,
+because they interact — scattered reads get worse with parallelism, sequential
+reads get better until the disk saturates. Measured on the real library, cold,
+with the page cache dropped before every read — 60 random files, 881 MB, 4,022
+pages, and identical text extracted in every row:
 
-| Workers | Time | Throughput |
-|---|---|---|
-| **1** | **78 s** | **134 pages/s** |
-| 2 | 113 s | 93 pages/s |
-| 3 | 141 s | 75 pages/s |
+| Workers | Read pattern | Time | Throughput |
+|---|---|---|---|
+| 3 | scattered | 57.4 s | 69 pages/s |
+| 1 | streamed | 31.4 s | 128 pages/s |
+| 2 | streamed | 16.9 s | 238 pages/s |
+| **3** | **streamed** | **14.9 s** | **271 pages/s** |
+| 4 | streamed | 15.1 s | 266 pages/s |
 
-One worker is the default for that reason, and it also explains the old
-72-minute run: at three workers the extraction ceiling is ~75 pages/s, and the
-run achieved 73.
+A second, wider sample (80 files, 6,001 pages) agreed: 3 workers streamed
+reached 328 pages/s against 62 pages/s for the old pattern, ~5.3×, and 4 and 6
+workers were again slower than 3. So the default is 3 workers *with* streaming,
+~3.9× the old code on the narrower sample and better on the wider one.
 
-This is not theoretical either: at 8 workers the web app was observed stuck in
-uninterruptible disk sleep (`State: D`, `wchan: read_extent_buffer_pages`),
-unable to serve a single request, purely because the indexer had saturated the
-disk queue.
+That also disposes of the old story about this machine: the 72-minute run at
+3 workers was not slow because three workers were too many, it was slow because
+each of them was issuing scattered reads. `--workers 1` without streaming is
+only ~1.8× better, which is why the two changes belong together.
+
+Streaming also makes the run *gentler*, not just shorter: a sequential read is
+one seek for megabytes, and finishing in a fifth of the time leaves the disk
+idle for far longer. It is still not free, though — at 8 workers the web app
+was observed stuck in uninterruptible disk sleep (`State: D`,
+`wchan: read_extent_buffer_pages`), unable to serve a single request, purely
+because the indexer had saturated the disk queue. Do not add workers past the
+measured optimum.
 
 The app therefore launches the indexer as
-`ionice -c2 -n7 nice -n 19 ... --workers 1`: best-effort I/O at the lowest
+`ionice -c2 -n7 nice -n 19 ... --workers 3`: best-effort I/O at the lowest
 priority, so heavy reads yield to interactive traffic but still get scheduled.
-Indexing takes longer than an unconstrained run but the library stays
-responsive throughout.
 
 > **Do not use `ionice -c3` (idle class) here.** On the `mq-deadline`
 scheduler idle-class requests are only dispatched when the disk queue is
@@ -622,7 +642,7 @@ safe to delete at any time.
 | `GET /api/dtrpg/status` | sync job state + log tail |
 | `POST /api/dtrpg/sync?dry_run=0&dedupe=1&merge=1&rescan=1` | start DriveThruRPG sync |
 | `GET /api/index/status` | PDF index progress |
-| `POST /api/index/build?rebuild=0&workers=1` | start PDF text indexing (one worker: more thrashes the disk) |
+| `POST /api/index/build?rebuild=0&workers=3` | start PDF text indexing (three workers, each streaming a whole file: fastest measured on the library disk) |
 | `POST /api/rescan` | rebuild the catalog |
 | `GET /thumb/{fid}?w=320\|1600` | cached downscaled image (see file lists) |
 | `GET /cover/{cid}` | cached shelf cover for a collection |

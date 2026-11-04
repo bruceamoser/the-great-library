@@ -966,11 +966,11 @@ def external_index_running() -> bool:
     return False
 
 
-def _run_index(rebuild: bool, workers: int = 1) -> None:
+def _run_index(rebuild: bool, workers: int = 3) -> None:
     rc = -1
     try:
         # Keep the indexer from starving the web app: the library is on a
-        # single spinning disk, so heavy parallel reads block everything else.
+        # single spinning disk, so give the indexing reads low I/O priority.
         import shutil
         launcher = []
         if shutil.which('ionice'):
@@ -1002,7 +1002,7 @@ def _run_index(rebuild: bool, workers: int = 1) -> None:
 
 
 @app.post('/api/index/build')
-def api_index_build(rebuild: int = 0, workers: int = 1):
+def api_index_build(rebuild: int = 0, workers: int = 3):
     """Extract PDF text into the search index, in the background."""
     with _index_lock:
         if _index_state['running'] or external_index_running():

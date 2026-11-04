@@ -34,26 +34,37 @@ leaves a consistent index that the next run continues from — Ctrl-C flushes th
 open batch first, and killing the process outright only loses the batch that
 had not been committed yet.
 
-IMPORTANT: the library lives on a single spinning disk, and parallel PDF reads
-are effectively random access, so extra workers thrash the disk instead of
-going faster. Measured on the real library — 200 PDFs, cold, the same files
-each time with the page cache evicted before every read:
+READING is what makes a rebuild slow, and the read *pattern* was the problem.
+Left to itself MuPDF walks each file's object graph and issues many small,
+scattered reads, which on a single spinning disk becomes a stream of seeks.
+Reading each file in one sequential pass first (`open_pdf()`, whole file into
+memory) and parsing it from there removes that.
 
-    --workers 1    78 s   134 pages/s
-    --workers 2   113 s    93 pages/s
-    --workers 3   141 s    75 pages/s
+Measured on the real library, cold — the page cache evicted before every read,
+60 random files, 881 MB, 4,022 pages, identical text extracted in every row:
 
-One worker is therefore the default: on this disk it is ~1.8x faster than
-three and far gentler on everything else using the disk (the web app has been
-observed stuck in uninterruptible disk sleep when the indexer saturated it).
-Raise --workers only if the library is on SSD. Run under `ionice -c2 -n7` /
-`nice -n 19`, as the web app does. Do NOT use `ionice -c3` (idle): on
-mq-deadline it is effectively starved and runs ~25x slower.
+    workers  read pattern    time    throughput
+       3     scattered      57.4 s    69 pages/s
+       1     sequential     31.4 s   128 pages/s
+       2     sequential     16.9 s   238 pages/s
+       3     sequential     14.9 s   271 pages/s
+       4     sequential     15.1 s   266 pages/s
+
+The worker count only matters together with the read pattern: with scattered
+reads more workers *hurt*, with sequential reads they help until the disk
+saturates (three, here) — hence DEFAULT_WORKERS = 3. Three workers streaming is
+about 3.9x the old configuration, and finishes sooner, so the disk is busy for
+far less time overall. Files above --stream-max-mb (default 256 MB, above the
+library's 99th percentile) are opened in place, so worker memory stays bounded.
+
+Run under `ionice -c2 -n7` / `nice -n 19`, as the web app does. Do NOT use
+`ionice -c3` (idle): on mq-deadline it is effectively starved and runs ~25x
+slower.
 
 Usage:
   ionice -c2 -n7 nice -n 19 python3 index_pdf_text.py \
-      --library /mnt/disk5/RPG-Library --db library.db [--workers 1]
-      [--rebuild] [--limit N] [--batch-mb 12]
+      --library /mnt/disk5/RPG-Library --db library.db [--workers 3]
+      [--rebuild] [--limit N] [--batch-mb 12] [--stream-max-mb 256]
 """
 import argparse
 import os
@@ -69,10 +80,15 @@ MAX_PAGE_CHARS = 200_000
 BATCH_MB = 12
 BATCH_FILES = 200
 BULK_CACHE_MB = 64
-# One worker: on the library's spinning disk extra readers thrash instead of
-# helping (measured 134 pages/s at 1 worker vs 75 at 3 — see the module
-# docstring). Only raise this for a library on SSD.
-DEFAULT_WORKERS = 1
+# Read each PDF as one sequential run instead of letting MuPDF issue its own
+# scattered small reads; see open_pdf(). Files above the cap are opened in
+# place, so worker memory stays bounded (the library's p99 file is 122 MB).
+STREAM_MAX_MB = 256
+# Three workers, each reading one whole file sequentially, is the fastest
+# configuration measured on the library's spinning disk: 3.86x the throughput
+# of the same worker count reading scattered (see the module docstring). Both
+# fewer and more workers were slower.
+DEFAULT_WORKERS = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pdf_status (
@@ -108,12 +124,44 @@ def ensure_schema(con):
     return con
 
 
+def open_pdf(pymupdf, abs_path, stream_max_bytes):
+    """Open a PDF, reading files small enough to fit in one sequential pass.
+
+    MuPDF walks a file's object graph as it parses, so its reads arrive in an
+    order that is not sequential on disk. On the library's spinning disk that
+    is what made a full rebuild slow: the same workers reading whole files
+    sequentially run 3.86x faster, and *gain* from running in parallel instead
+    of losing, because one large read costs one seek. Files above
+    `stream_max_bytes` are opened in place, so worker memory stays bounded.
+    """
+    if stream_max_bytes > 0:
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            size = None
+        if size is not None and size <= stream_max_bytes:
+            try:
+                with open(abs_path, 'rb') as fh:
+                    data = fh.read()
+            except OSError:
+                data = None
+            if data is not None:
+                try:
+                    return pymupdf.open(stream=data, filetype='pdf')
+                except Exception:
+                    # Forcing the PDF handler can fail where sniffing would
+                    # succeed (a mislabelled file), so fall back to the path.
+                    pass
+    return pymupdf.open(abs_path)
+
+
 def extract(job):
     """Worker: return (rel_path, mtime, pages, chars, [(page, text), ...])."""
-    rel_path, abs_path, mtime = job
+    rel_path, abs_path, mtime, stream_max_bytes = job
     try:
         import pymupdf
-        doc = pymupdf.open(abs_path)
+        doc = open_pdf(pymupdf, abs_path, stream_max_bytes)
+
         rows = []
         total = 0
         for i in range(doc.page_count):
@@ -230,9 +278,16 @@ def build_parser():
     ap.add_argument('--db', required=True)
     ap.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
                     help=f'extraction processes (default {DEFAULT_WORKERS}: '
-                         f'more than one thrashes the library disk)')
+                         f'each worker reads one file sequentially, which is '
+                         f'the fastest measured on the library disk; try 1 on '
+                         f'a slow or heavily used machine)')
     ap.add_argument('--rebuild', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--stream-max-mb', type=float, default=STREAM_MAX_MB,
+                    help=f'read PDFs up to this size into memory before '
+                         f'parsing (default {STREAM_MAX_MB}); 0 disables and '
+                         f'lets MuPDF read the file itself, which is much '
+                         f'slower on a spinning disk')
     ap.add_argument('--batch-mb', type=float, default=BATCH_MB,
                     help=f'commit once this much page text is buffered '
                          f'(default {BATCH_MB}); lower loses less work to a '
@@ -261,7 +316,8 @@ def main():
         mtime = os.path.getmtime(abs_path)
         if done.get(rel_path) == mtime:
             continue
-        jobs.append((rel_path, abs_path, mtime))
+        jobs.append((rel_path, abs_path, mtime,
+                     int(args.stream_max_mb * 1024 * 1024)))
 
     if args.limit:
         jobs = jobs[:args.limit]
