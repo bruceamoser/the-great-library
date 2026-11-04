@@ -209,9 +209,69 @@ templates.env.globals['cover_v'] = _cover_version
 templates.env.filters['filesize'] = human_size
 
 
-def db():
-    con = sqlite3.connect(DB, timeout=30)
+# SQLite starts every connection with a 2 MB page cache, no memory map and temp
+# tables on disk. That is invisible on a small database and painful on this one:
+# the catalogue is 3.66 GB, so a cold connection re-read the same hot pages for
+# every request. These pragmas are applied on every connection instead, and can
+# be changed from the environment (see README).
+_TEMP_STORE = {'DEFAULT': 0, 'FILE': 1, 'MEMORY': 2}
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """A non-negative integer from the environment, or the default if unusable."""
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def sqlite_settings() -> dict:
+    """The pragmas every catalogue connection gets, as {pragma: value}.
+
+    Read per connection rather than at import so a test or a restart can change
+    them without re-importing the module. Values are coerced to integers and
+    temp_store is a fixed vocabulary, so an environment typo cannot inject SQL.
+    """
+    temp = str(os.environ.get('RPG_SQLITE_TEMP_STORE', 'MEMORY')).strip().upper()
+    return {
+        # negative cache_size is KiB rather than pages: -65536 is 64 MB
+        'cache_size': -_env_int('RPG_SQLITE_CACHE_MB', 64, 1) * 1024,
+        'mmap_size': _env_int('RPG_SQLITE_MMAP_MB', 256) * 1024 * 1024,
+        'temp_store': _TEMP_STORE.get(temp, _TEMP_STORE['MEMORY']),
+        'busy_timeout': _env_int('RPG_SQLITE_BUSY_TIMEOUT_MS', 5000),
+    }
+
+
+def _connect(path: str, write: bool) -> sqlite3.Connection:
+    """Open the catalogue file, read-only unless the caller needs to change it."""
+    if not write and os.path.exists(path):
+        uri = 'file:' + quote(os.path.abspath(path)) + '?mode=ro'
+        try:
+            return sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError as exc:
+            # A WAL catalogue whose -shm is gone (an interrupted writer) cannot
+            # be opened read-only. Serving pages from a read-write handle beats
+            # failing every request until someone notices.
+            print(f'library: {path} is not readable read-only ({exc}); '
+                  'falling back to a read-write connection', file=sys.stderr)
+    # write=True, or no catalogue on disk yet: opening read-write keeps the app
+    # starting so the pages render (empty) instead of failing at connect time.
+    return sqlite3.connect(path)
+
+
+def db(write: bool = False) -> sqlite3.Connection:
+    """A catalogue connection carrying the tuned pragmas.
+
+    Reads use a read-only handle, so a GET that tries to mutate the catalogue
+    fails with 'attempt to write a readonly database' instead of quietly
+    splitting a write across connections. Only routes that change the catalogue
+    pass write=True.
+    """
+    con = _connect(DB, write)
     con.row_factory = sqlite3.Row
+    for name, value in sqlite_settings().items():
+        con.execute(f'PRAGMA {name}={int(value)}')
     return con
 
 
@@ -1033,16 +1093,19 @@ def api_index_status(lines: int = 60):
     state['tail'] = _read_log_tail(INDEX_LOG, lines)
     try:
         con = db()
-        row = con.execute(
-            'SELECT COUNT(*) n, COALESCE(SUM(pages),0) p, '
-            'COALESCE(SUM(chars),0) c FROM pdf_status').fetchone()
-        state['indexed_files'] = row['n']
-        state['indexed_pages'] = row['p']
-        state['indexed_chars'] = row['c']
-        state['total_pdfs'] = con.execute(
-            "SELECT COUNT(*) c FROM files WHERE ext = '.pdf'").fetchone()['c']
-        con.close()
+        try:
+            row = con.execute(
+                'SELECT COUNT(*) n, COALESCE(SUM(pages),0) p, '
+                'COALESCE(SUM(chars),0) c FROM pdf_status').fetchone()
+            state['indexed_files'] = row['n']
+            state['indexed_pages'] = row['p']
+            state['indexed_chars'] = row['c']
+            state['total_pdfs'] = con.execute(
+                "SELECT COUNT(*) c FROM files WHERE ext = '.pdf'").fetchone()['c']
+        finally:
+            con.close()
     except sqlite3.OperationalError:
+        # no catalogue, or one that has never been indexed
         state.update(indexed_files=0, indexed_pages=0, indexed_chars=0,
                      total_pdfs=0)
     return JSONResponse(state)
@@ -1097,7 +1160,7 @@ async def edit_metadata(cid:int,request:Request):
     except (ValueError,TypeError):raise HTTPException(400,'Invalid cover page')
     try:
         with jobs.lease():
-            con=db()
+            con=db(write=True)
             try:
                 row=con.execute('SELECT rel_path,shelf FROM collections WHERE id=?',(cid,)).fetchone()
                 if not row:raise HTTPException(404,'Collection not found')
@@ -1124,11 +1187,16 @@ async def edit_metadata(cid:int,request:Request):
 
 @app.get('/classification')
 def classification_review(request:Request,all:bool=False):
-    con=db()
     import taxonomy
-    taxonomy.initialize(con)
-    rows=con.execute("SELECT c.*,a.source_shelf,a.rule,a.needs_review FROM collections c JOIN classification_audit a USING(rel_path) WHERE (? OR a.needs_review=1) ORDER BY c.name",(all,)).fetchall()
-    con.close()
+    con=db()
+    try:
+        # Creating the audit table is a no-op once it exists, which is the
+        # normal case: catalog.py builds it. A catalogue old enough to lack it
+        # needs one writable connection to catch up, not a writable route.
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name='classification_audit'").fetchone():
+            con.close();con=db(write=True);taxonomy.initialize(con)
+        rows=con.execute("SELECT c.*,a.source_shelf,a.rule,a.needs_review FROM collections c JOIN classification_audit a USING(rel_path) WHERE (? OR a.needs_review=1) ORDER BY c.name",(all,)).fetchall()
+    finally:con.close()
     return templates.TemplateResponse(request,'classification.html',{'rows':rows,'all':all,'shelf_label':shelf_label})
 
 
@@ -1201,7 +1269,7 @@ async def edit_book_metadata(fid:int,request:Request):
     if fields['volume'] is not None and not 1<=fields['volume']<=9999:raise HTTPException(400,'Invalid volume')
     try:
         with jobs.lease():
-            con=db()
+            con=db(write=True)
             try:
                 classification.initialize(con)
                 row=con.execute('SELECT rel_path FROM files WHERE id=?',(fid,)).fetchone()
