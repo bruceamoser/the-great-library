@@ -384,8 +384,8 @@ Measured on this machine, full rebuild of the restructured library
 
 That run used the old code, which let MuPDF read each PDF in its own scattered
 order. Reading each file as one sequential stream and parsing it from memory is
-~3.9× faster at the same worker count, so the same rebuild should take
-**~17–20 min** rather than 72. See *Why three workers, and why streamed reads*
+~3.9–5.3× faster at the same worker count, so the same rebuild should take
+**~16–20 min** rather than 72. See *Why three workers, and why streamed reads*
 below.
 
 A full rebuild takes tens of minutes because every PDF must be re-extracted;
