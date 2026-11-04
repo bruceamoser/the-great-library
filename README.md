@@ -357,6 +357,33 @@ The default search indexes collection names, shelves, tags and **filenames**.
 A separate opt-in index adds the **text inside** every PDF, so a search for
 `grappling` returns matching *pages*, not just files whose names contain it.
 
+### Search architecture
+
+Search is **SQLite FTS5 inside the same `library.db` as the catalogue** — there
+is no search server. Why that is the right engine here, what would change it,
+and what it costs are recorded in
+[docs/adr/0001-search-architecture.md](docs/adr/0001-search-architecture.md).
+
+Current live catalogue, measured on 2026-11-04: **763 collections**, **25,227
+files**, **309,790 indexed pages**, `library.db` **3.66 GB**. (Older figures
+elsewhere in this README describe the October restructure as it stood then.)
+
+| Query on the live catalogue | HDD (live host) | NVMe (copy) |
+|---|---|---|
+| content total — `COUNT(*)` over `pdf_fts MATCH`, 26,634 hits | 16,006 ms | **70 ms** |
+| content page — 36 results | 439 ms | — |
+| files `filename LIKE '%…%'` count | 2,779 ms | — |
+| collections `LIKE` count | 72 ms | — |
+
+The 16 s figure is **random reads of unindexed FTS columns on a spinning disk,
+not a limit of SQLite** — the identical database answers the identical count in
+70 ms on NVMe. Note also that the slow part is the *total*, not the page: the 36
+rows a reader actually sees cost 439 ms. Hence the current work: keep
+`library.db` on NVMe with the media on the HDD, compute totals only for the
+active section (#3), search filenames and classification through FTS instead of
+`LIKE` scans (#4), tune the connection pragmas (#5), and rebuild the PDF index
+with integer keys and external content (#6).
+
 ### Build it
 
 From the app: **Sync & Index** → *Build / update index*.
@@ -779,3 +806,7 @@ alone are a poor signal, and the server says so explicitly in
 See [RELEASE-NOTES.md](RELEASE-NOTES.md) for the redesigned interface, reading desk, classification ledger, persistent annotations, maintenance security, regression tests, and backup/restore instructions. The classification rules are in `taxonomy.py`; manual choices are stored in `metadata_overrides` and survive scans.
 
 See [FOLLOWUP-NOTES.md](FOLLOWUP-NOTES.md) for the October 7 search feedback, search-return navigation, TIFF previews, and per-file classification hierarchy.
+
+Architecture decisions live in [`docs/adr/`](docs/adr/):
+
+- [0001 — Search stays on SQLite FTS5](docs/adr/0001-search-architecture.md)
