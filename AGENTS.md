@@ -50,6 +50,14 @@ previous code, restarts the service through its own endpoint and health-checks
 it. Run it from this checkout, not from the host copy. It never touches library
 data.
 
+## GitHub access
+
+This repository belongs to the personal account. Use
+`/home/bmoser/.local/bin/gh-personal` for every `gh` command: it pins
+`bruceamoser` for that process. Plain `gh` is authenticated as the work account,
+cannot write here, and switching accounts would disrupt unrelated work. The
+checkout's local git config already routes pushes through the same helper.
+
 ## Conventions
 
 - `app.py` holds the FastAPI routes; `catalog.py` builds the catalogue;
