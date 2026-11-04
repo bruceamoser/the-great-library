@@ -410,7 +410,9 @@ Deploy the new code first: until the migration runs, the app treats the content
 index as absent and simply shows no inside-book results. The migration itself
 copies every page once, so keep the same `ionice`/`nice` wrapper and allow a
 few minutes; `--vacuum` additionally needs temporary free space roughly equal
-to the final database size (~2 GB).
+to the final database size (~2 GB). Run it at a quiet moment: if SQLite reports
+the database is locked during `VACUUM`, re-run the same command — the schema
+upgrade is already committed and is skipped, and only the VACUUM is retried.
 
 ### Why only 3 workers, and why `ionice`
 
