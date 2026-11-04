@@ -339,6 +339,57 @@ def index(request: Request):
     })
 
 
+# Search totals are COUNT(*) scans, not page data: the content total walks the
+# whole full-text index (16 s on the live HDD catalogue) and the files total is
+# a LIKE over every row (2.8 s). Only the tab being rendered needs a number, so
+# the count is computed for that tab alone and remembered for a minute -- long
+# enough to make tab-switching free, short enough that a rescan shows up.
+SEARCH_TOTAL_TTL = 60.0
+SEARCH_TOTAL_CACHE_MAX = 128
+_search_totals = {}
+_search_totals_lock = threading.Lock()
+
+
+def search_total(key, compute):
+    """Return a cached count, recomputing at most once per TTL window."""
+    now = time.monotonic()
+    with _search_totals_lock:
+        hit = _search_totals.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    value = compute()
+    with _search_totals_lock:
+        if len(_search_totals) >= SEARCH_TOTAL_CACHE_MAX:
+            for stale in [k for k, v in _search_totals.items() if v[0] <= now]:
+                del _search_totals[stale]
+            while len(_search_totals) >= SEARCH_TOTAL_CACHE_MAX:
+                _search_totals.pop(next(iter(_search_totals)))
+        _search_totals[key] = (now + SEARCH_TOTAL_TTL, value)
+    return value
+
+
+def clear_search_totals():
+    """Forget every cached total; call it after the catalogue changes."""
+    with _search_totals_lock:
+        _search_totals.clear()
+
+
+def count_rows(con, sql, args=()):
+    """COUNT(*) that reads 0 when the PDF index has not been built yet."""
+    try:
+        return con.execute(sql, args).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0
+
+
+def has_pdf_index(con) -> bool:
+    try:
+        return bool(con.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'pdf_fts'").fetchone())
+    except sqlite3.OperationalError:      # pragma: no cover - closed database
+        return False
+
+
 @app.get('/search', response_class=HTMLResponse)
 def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
            tag: str = '', cat: str = '', subcat: str = '',
@@ -366,21 +417,28 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
             cw+=' OR c.id IN (SELECT collection_id FROM search WHERE search MATCH ?)'; cp.append(match)
         cw+=')'
         fw+=' AND (f.filename LIKE ? OR EXISTS(SELECT 1 FROM book_classification b WHERE b.rel_path=f.rel_path AND (b.system LIKE ? OR b.series LIKE ? OR b.campaign LIKE ?)))'; fp.extend(['%'+q+'%']*4)
-    import campaigns
-    campaign_items=campaigns.catalog(con)
-    eligible={r[0] for r in con.execute('SELECT c.id FROM collections c WHERE '+('EXISTS(SELECT 1 FROM files f WHERE f.collection_id=c.id AND '+filters+')'),params)}
-    campaign_items=[c for c in campaign_items if (not q or q.casefold() in (c['name']+' '+c['edition']).casefold()) and any(i in eligible for i in c['collections'])]
-    totals={'campaigns':len(campaign_items)}
-    totals['collections']=con.execute('SELECT COUNT(*) FROM collections c WHERE '+cw,cp).fetchone()[0]
     join=' FROM files f JOIN collections c ON c.id=f.collection_id WHERE '
-    totals['files']=con.execute('SELECT COUNT(*)'+join+fw,fp).fetchone()[0]
     pw='pdf_fts MATCH ? AND '+filters; pp=[match]+params
     pj=' FROM pdf_fts p JOIN files f ON f.rel_path=p.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
-    index_available=True
-    try:
-        totals['content']=con.execute('SELECT COUNT(*)'+pj+pw,pp).fetchone()[0] if match else 0
-    except sqlite3.OperationalError:
-        totals['content']=0; index_available=False
+    index_available=has_pdf_index(con)
+    # Only the rendered tab needs a total; the other three cost seconds and are
+    # never displayed (the template omits their badges).
+    key=(DB,section,q,cat,subcat,kind,shelf,tag)
+    totals={}; campaign_items=[]
+    if section=='campaigns':
+        import campaigns
+        items=campaigns.catalog(con)
+        eligible={r[0] for r in con.execute('SELECT c.id FROM collections c WHERE EXISTS(SELECT 1 FROM files f WHERE f.collection_id=c.id AND '+filters+')',params)}
+        campaign_items=[c for c in items if (not q or q.casefold() in (c['name']+' '+c['edition']).casefold()) and any(i in eligible for i in c['collections'])]
+        totals['campaigns']=len(campaign_items)
+    elif section=='collections':
+        totals['collections']=search_total(key,lambda: count_rows(con,'SELECT COUNT(*) FROM collections c WHERE '+cw,cp))
+    elif section=='files':
+        totals['files']=search_total(key,lambda: count_rows(con,'SELECT COUNT(*)'+join+fw,fp))
+    elif match and index_available:
+        totals['content']=search_total(key,lambda: count_rows(con,'SELECT COUNT(*)'+pj+pw,pp))
+    else:
+        totals['content']=0
     pages=max(1,(totals[section]+size-1)//size); page=min(page,pages)
     offset=(page-1)*size
     collections=[]; files=[]; content_hits=[]
@@ -401,7 +459,7 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         return '/search?'+urlencode({k:v for k,v in values.items() if v!=''})
     return templates.TemplateResponse(request,'search.html',dict(
         q=q,shelf=shelf,kind=kind,tag=tag,cat=cat,subcat=subcat,mode='query' if q else 'filter',
-        campaigns=campaign_items[offset:offset+size] if section=='campaigns' else [],collections=collections,files=files,content_hits=content_hits,highlight=highlight,
+        campaigns=campaign_items[offset:offset+size],collections=collections,files=files,content_hits=content_hits,highlight=highlight,
         all_tags=all_tags,shelves=shelves,shelf_label=shelf_label,kinds=KIND_ORDER,
         cats=CATEGORY_ORDER,subcats=SUBCATEGORY,category_label=CATEGORY_LABEL,
         subcategory_label=SUBCATEGORY_LABEL,totals=totals,page=page,pages=pages,
@@ -744,6 +802,7 @@ def api_rescan(moves: str = ''):
         if r.returncode != 0:
             return JSONResponse({'ok': False, 'error': r.stderr[-2000:]},
                                 status_code=500)
+        clear_search_totals()
         return JSONResponse({'ok': True, 'output': r.stdout})
     finally:
         with _index_lock:
@@ -809,6 +868,7 @@ def _run_sync(dry_run, rescan, dedupe, merge):
     except Exception as exc:
         with open(SYNC_LOG,'a') as log: log.write(str(exc)+'\n')
     finally:
+        clear_search_totals()
         with _sync_lock:
             _sync_state.update(running=False, finished=time.time(), returncode=rc)
 
@@ -996,6 +1056,7 @@ def _run_index(rebuild: bool, workers: int = 3) -> None:
             log.write(f'\nERROR launching indexer: {exc}\n')
         rc = -1
     finally:
+        clear_search_totals()
         with _index_lock:
             _index_state.update(running=False, finished=time.time(),
                                 returncode=rc)
