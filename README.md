@@ -129,6 +129,25 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rpg-library
 ```
 
+### Deploying updates
+
+The repository is the source of truth; the host runs a deployed copy at
+`/mnt/disk5/rpg-app`. `deploy.sh` syncs the application code and restarts the
+service over SSH:
+
+```sh
+./deploy.sh --dry-run     # show what would change
+./deploy.sh               # back up, sync, restart, health-check
+```
+
+It never touches library data (`library.db`, `covers/`, `thumbnails/`,
+`inbox-originals/`, `provenance.json`), takes a code-only backup under
+`/mnt/disk4/RPG-Library-Backups/`, and restarts through the app's own endpoint,
+so it needs no sudo. `--prune` also deletes files removed from the repository;
+`--no-backup` and `--no-restart` skip those steps. Override the target with
+`DEPLOY_HOST`, `DEPLOY_DIR`, `DEPLOY_SERVICE`, `DEPLOY_URL` or
+`DEPLOY_BACKUP_ROOT`.
+
 ### Restarting from the app
 
 The **Refresh** page has a *Restart the library app* button. It calls
@@ -468,6 +487,7 @@ rpg-app/
   library.db             SQLite + FTS5 catalog (760 collections)
   provenance.json        source registry (DriveThruRPG, Takeout, assets)
   run.sh                 launcher
+  deploy.sh              sync code from a checkout to the host and restart it
   rescan.sh              rebuild catalog
   dedupe.sh              run de-duplication
   merge-dtrpg.sh         merge a DriveThruRPG sync into the shelves
