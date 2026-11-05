@@ -443,7 +443,8 @@ That run used the old code, which let MuPDF read each PDF in its own scattered
 order. Reading each file as one sequential stream and parsing it from memory is
 ~3.9–5.3× faster at the same worker count, so the same rebuild should take
 **~16–20 min** rather than 72. See *Why three workers, and why streamed reads*
-below.
+below. A later, direct measurement of the streamed code came out faster still,
+nearer **12–15 min** (*Measuring PDF extraction*).
 
 ### Upgrade an existing index
 
@@ -536,9 +537,18 @@ pages, and identical text extracted in every row:
 | 4 | streamed | 15.1 s | 266 pages/s |
 
 A second, wider sample (80 files, 6,001 pages) agreed: 3 workers streamed
-reached 328 pages/s against 62 pages/s for the old pattern, ~5.3×, and 4 and 6
-workers were again slower than 3. So the default is 3 workers *with* streaming,
-~3.9× the old code on the narrower sample and better on the wider one.
+reached 328 pages/s against 62 pages/s for the old pattern, ~5.3×. So the
+default is 3 workers *with* streaming, ~3.9× the old code on the narrower
+sample and better on the wider one.
+
+Re-measured later against the current code with `benchmarks/index_bench.py`
+(*Measuring PDF extraction* below), the curve is flatter than that first run
+suggested: 2 workers behind in every sample (267–314 pages/s on the larger
+ones), **392 at 3**, 425 at 4 and 403 at 6, with 3 and 4 trading places between
+samples. Two is clearly too few and six is no better than three, so the default
+stays at 3 — a 4–7% difference is inside the ±13% spread between sessions, and
+every extra worker is another stream of seeks competing with the app. Raise it
+with `--workers` if the library moves to an SSD.
 
 That also disposes of the old story about this machine: the 72-minute run at
 3 workers was not slow because three workers were too many, it was slow because
@@ -666,6 +676,7 @@ rpg-app/
   thumbnails.py          pre-generates the thumbnail cache (see below)
   mcp_server.py          MCP server for AI assistants (see section 11)
   benchmarks/search_bench.py   offline /search benchmark (see below)
+  benchmarks/index_bench.py    offline PDF-extraction benchmark (see below)
   tests/                 unittest suite; needs no library data
   .venv/                 Python 3.14 virtualenv
 ```
@@ -825,6 +836,74 @@ to `uvicorn.log`, which `./manage.sh logs` tails. Two limits worth knowing: a
 streamed response (a file from `/raw`, a thumbnail) is timed up to its headers
 rather than to its last byte, and the log records the `section` parameter but
 not the search terms themselves.
+
+#### Measuring PDF extraction
+
+A rebuild is ~96% PDF reading and ~4% everything else, so `index_pdf_text.py`
+has its own benchmark: **`benchmarks/index_bench.py`**. It runs the real
+`index_pdf_text.extract()` through a real `multiprocessing.Pool` with
+`chunksize=1`, exactly as `main()` does, over a sample of the actual library.
+Nothing is re-implemented — `open_pdf()` decides how each file is read, so
+`--patterns streamed` measures the shipped path and `inplace` measures the
+scattered reads it replaced (`--stream-max-mb 0`). **It never opens a database**,
+so it is safe against the live library while the app is serving.
+
+```sh
+ionice -c2 -n7 nice -n 19 ./.venv/bin/python benchmarks/index_bench.py \
+    --library /mnt/disk5/RPG-Library --sample 120 --rounds 2
+```
+
+The reason it is a script and not a one-liner is the page cache. The host has
+30 GB of RAM against a 67 GB library, so a run that follows another run is
+partly warm and reports two to three times the real throughput. Every measured
+run evicts the sample's clean pages with `posix_fadvise(POSIX_FADV_DONTNEED)`
+first, the configurations are interleaved round by round so any drift in disk
+or CPU state hits all of them equally, and the extracted page and character
+counts are compared — a configuration that quietly extracted less text would
+otherwise look like a win.
+
+`--no-evict` runs warm on purpose, and it is the control that shows the
+eviction is real. Same 60 files, same machine, current code:
+
+| Workers | Pattern | Cold | Warm (`--no-evict`) |
+|---|---|---|---|
+| 3 | streamed | 475 pages/s | 1,216 pages/s |
+| 3 | in place | 55 pages/s | 1,190 pages/s |
+
+Warm, the read pattern stops mattering: everything is in RAM, so both paths
+run at ~1,200 pages/s. Cold, scattered reads lose 22× while streamed reads
+lose only 2.6× — that gap *is* the seek cost the streaming change removes.
+Cold is the honest number for a full rebuild: 67 GB cannot stay in 30 GB of
+page cache, which is why `--no-evict` is a control and not a measurement.
+
+Measured cold on the host with this tool, current code. 60 files (657 MiB,
+3,796 pages), one round:
+
+| Workers | streamed | in place |
+|---|---|---|
+| 1 | 14.81 s — 256 pages/s | 20.25 s — 188 pages/s |
+| 2 | 9.31 s — 408 pages/s | 50.99 s — 74 pages/s |
+| **3** | **8.00 s — 475 pages/s** | 68.54 s — 55 pages/s |
+| 4 | 7.95 s — 478 pages/s | 70.11 s — 54 pages/s |
+
+The two columns are the whole story. With scattered reads, *adding* workers
+makes things worse — 188 pages/s at one worker down to 54 at four, because
+each reader is a competing stream of seeks. With streamed reads it goes the
+other way, 256 up to 475. That is why the worker count and the read pattern
+are one change and not two.
+
+A larger sample (120 files, 1,460 MiB, 7,685 pages, two interleaved rounds)
+reproduced the top of that curve: 3 workers 19.58 s (392 pages/s, 74.5 MiB/s),
+4 workers 18.09 s (425 pages/s, 80.7 MiB/s), 6 workers 19.06 s (403 pages/s),
+and 2 workers clearly behind at 267–314 pages/s across samples. A third sample
+put 3 workers at 405 and 4 at 423, so 3 and 4 are within the spread between
+sessions — which is why the default stayed at 3. At the same worker count the
+streamed path is **~8.6× the old in-place path** (475 vs 55 pages/s).
+
+That projects a full rebuild of the current library — 5,136 PDFs, 68,230 MiB,
+319,841 pages — at **~12–15 min** of extraction plus under a minute of writes,
+against the 72 minutes the old code took. It is still a projection from sampled
+files, not a complete run; `--json` prints the same numbers as one object.
 
 ---
 

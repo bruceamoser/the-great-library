@@ -72,6 +72,25 @@ host that disk is spinning: a content total over 309,790 pages takes 16 s there
 and 70 ms on NVMe for the same database. Measure there before believing an
 optimisation helped.
 
+## Measuring PDF indexing
+
+A rebuild is almost entirely PDF reading, so that is what has its own benchmark.
+`benchmarks/index_bench.py` runs the real `index_pdf_text.extract()` through a
+real process pool over a sample of the actual library and never opens a
+database, so it is safe against the live catalogue.
+
+```sh
+ionice -c2 -n7 nice -n 19 ./.venv/bin/python benchmarks/index_bench.py \
+    --library /mnt/disk5/RPG-Library --sample 120 --rounds 2
+```
+
+It evicts the page cache before every run and interleaves the configurations,
+because the host has 30 GB of RAM against a 67 GB library and a warm run reports
+two to three times the real throughput. `--no-evict` is the warm control.
+Compare `--patterns streamed` (the shipped read path) with `inplace` (what it
+replaced) at the same worker count, and hold `--sample`/`--seed` fixed between
+runs.
+
 ## Running locally
 
 ```sh
