@@ -20,19 +20,11 @@ The rules
    synthetic set.  This is a backstop against collapse, not a benchmark: the
    structural rules above are exact and deterministic.
 
-Parking a rule behind an open issue
------------------------------------
-
-All four rules are hard gates today: ``PENDING`` below is empty, because the work
-they were waiting on has landed (#3 made the section totals lazy and cached, #4
-moved the filename and classification searches onto ``files_fts``).  The
-mechanism is kept for the next rule that has to land in a later change - a rule
-listed in ``PENDING`` with the issue that removes the offending statement is
-*skipped* with that issue named instead of failing, its test raises a
-``UserWarning`` once the rule starts passing, and deleting the entry turns the
-check into a hard gate.  ``RPG_PERF_STRICT=1`` (set in CI) enforces any pending
-rule immediately even before its issue lands; ``RPG_PERF_LATENCY_MS`` overrides
-the latency budget.
+Every rule is enforced: there is no skip list, so a reintroduced full scan or an
+eagerly paid count always fails the suite rather than being parked on an issue.
+All four pass today because #3 made the section totals lazy and cached and #4
+moved the filename and classification searches onto ``files_fts``.
+``RPG_PERF_LATENCY_MS`` overrides the latency budget for a slower machine.
 
 Keeping the fixture honest
 --------------------------
@@ -51,7 +43,6 @@ import sys
 import tempfile
 import time
 import unittest
-import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,21 +62,6 @@ PDF_TEXT = 'dragon wisdom hoard treasure gryphon'
 
 LATENCY_BUDGET_MS = float(os.environ.get('RPG_PERF_LATENCY_MS') or 250)
 TIMING_REPEATS = 3
-STRICT = os.environ.get('RPG_PERF_STRICT') == '1'
-
-# rule name -> the open issue(s) whose fix removes the offending statement.
-# Empty: every rule passes today, so every rule is enforced.  Add an entry only
-# while the rule fails and an issue is open to fix it.
-PENDING = {}
-RULES = {
-    'default_does_not_count_content',
-    'default_does_not_like_scan_files',
-    'default_does_not_scan_files',
-    'query_does_not_count_content',
-    'query_does_not_like_scan_files',
-    'query_sections_do_not_scan_files',
-    'sections_answer_within_the_latency_budget',
-}
 
 URLS = {
     'default': '/search',
@@ -345,19 +321,10 @@ class SearchPerformanceTests(unittest.TestCase):
         return found
 
     def assert_rule(self, name, offenders):
-        """Enforce a rule, or skip it while the issue that blocks it is open."""
-        if not offenders:
-            if name in PENDING:
-                warnings.warn(
-                    f'{name} now passes; delete it from PENDING in '
-                    f'tests/test_performance.py so it is enforced', stacklevel=2)
-            return
-        detail = '\n'.join(offenders[:5])
-        if STRICT or name not in PENDING:
+        """Fail, naming the offending SQL, when a rule is broken."""
+        if offenders:
+            detail = '\n'.join(offenders[:5])
             self.fail(f'{name}: {len(offenders)} offending statement(s):\n{detail}')
-        blockers = ', '.join(f'#{issue}' for issue in PENDING[name])
-        self.skipTest(f'{name}: not enforced yet, waiting on {blockers} - '
-                      f'{len(offenders)} offending statement(s):\n{detail}')
 
     def collect(self, names, extract):
         """Every offender over `names`, each labelled with the request."""
@@ -451,10 +418,6 @@ class SearchPerformanceTests(unittest.TestCase):
                 if re.match(r'\s*SELECT\b', sql, re.I) and not params),
             'EXPLAIN QUERY PLAN returned nothing; the plan rules would pass vacuously')
         self.assertIn('Dragon Compendium', self.recorded_request(URLS['content'])[0].text)
-
-    def test_pending_rules_name_implemented_rules(self):
-        self.assertEqual(set(PENDING) - RULES, set(),
-                         'PENDING names a rule no test enforces')
 
 
 if __name__ == '__main__':
