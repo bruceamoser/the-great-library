@@ -417,6 +417,64 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
 );
 """
 
+# Per-file index behind the "Books & assets" section of /search. A leading
+# wildcard LIKE over 25k filenames could not use an index and scanned the whole
+# files and book_classification tables on every keystroke; this table is built
+# once per scan instead. Kept separate from `search` (one row per collection)
+# because the files section pages over individual files. `id` points back at
+# files.id and is not tokenised.
+FILES_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+  filename,
+  system,
+  series,
+  campaign,
+  id UNINDEXED,
+  tokenize = 'unicode61 remove_diacritics 2'
+);
+"""
+
+FILES_FTS_INSERT = """
+INSERT INTO files_fts(filename, system, series, campaign, id)
+SELECT f.filename, COALESCE(b.system, ''), COALESCE(b.series, ''),
+       COALESCE(b.campaign, ''), f.id
+  FROM files f LEFT JOIN book_classification b ON b.rel_path = f.rel_path
+"""
+
+SCHEMA += FILES_FTS_DDL
+
+
+def rebuild_files_fts(con):
+    """Rebuild the per-file index. Call after classification.enrich().
+
+    system/series/campaign come from book_classification, so the index is only
+    correct once enrichment has run. The delete and the rebuild happen in the
+    caller's transaction, so a reader sees the previous index or the new one,
+    never a half-built table.
+    """
+    import classification
+    classification.initialize(con)
+    con.execute(FILES_FTS_DDL)
+    con.execute('DELETE FROM files_fts')
+    con.execute(FILES_FTS_INSERT)
+    return con.execute('SELECT COUNT(*) FROM files_fts').fetchone()[0]
+
+
+def reindex_file(con, file_id):
+    """Refresh one file's index row after a manual classification change.
+
+    Returns False when files_fts has not been built yet; the next catalog scan
+    creates and fills it. It deliberately never creates the table on its own: a
+    partially populated index would silently hide the rest of the library from
+    the files search.
+    """
+    try:
+        con.execute('DELETE FROM files_fts WHERE id = ?', (file_id,))
+    except sqlite3.OperationalError:
+        return False
+    con.execute(FILES_FTS_INSERT + ' WHERE f.id = ?', (file_id,))
+    return True
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -598,6 +656,7 @@ def main():
 
     import classification
     classification.enrich(con)
+    n_fts = rebuild_files_fts(con)
     con.commit()
 
     # summary
@@ -605,6 +664,7 @@ def main():
     print(f"tracked files: {n_files}")
     print(f"untracked    : {untracked}  (software / vtt-data / archives - not indexed)")
     print(f"tags        : {len(tag_ids)}")
+    print(f"files index : {n_fts} rows in files_fts")
     print()
     print("files by category -> subcategory:")
     for cat, sub, cnt, b in cur.execute(

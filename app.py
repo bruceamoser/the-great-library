@@ -9,6 +9,7 @@ only (see run.sh).
 Run:  ./.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8765
 """
 import html as html_lib
+import logging
 import mimetypes
 import os
 import re
@@ -35,6 +36,33 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 LIBRARY = os.environ.get('RPG_LIBRARY', '/mnt/disk5/RPG-Library')
 DB = os.environ.get('RPG_DB', os.path.join(BASE, 'library.db'))
 CATALOG_PY = os.path.join(BASE, 'catalog.py')
+
+
+def _env_ms(name: str, default: float) -> float:
+    """A millisecond budget from the environment; junk falls back to `default`."""
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# One stderr line for any request slower than this; 0 turns the log off.
+# Without it the slow paths are invisible until a page visibly hangs: a content
+# total over 300k indexed pages was once measured at 16 s on the host's disk.
+SLOW_LOG_MS = _env_ms('RPG_SLOW_LOG_MS', 250.0)
+slow_log = logging.getLogger('rpg.slow')
+slow_log.setLevel(logging.INFO)
+if not slow_log.handlers:
+    # uvicorn configures only its own loggers, so the root logger has no
+    # handler and an INFO record would vanish. Give this logger its own:
+    # stderr goes to the journal under systemd, and nothing needs configuring.
+    _slow_handler = logging.StreamHandler(sys.stderr)
+    _slow_handler.setFormatter(logging.Formatter('%(message)s'))
+    slow_log.addHandler(_slow_handler)
+    slow_log.propagate = False
 
 # Cached downscaled images. The library holds map scans up to 184 MB and
 # 20064x13082 pixels; decoding one of those in the browser takes seconds and
@@ -193,6 +221,32 @@ async def protect_changes(request, call_next):
                 return JSONResponse({'error':'Maintenance is available on the library host. Remote administration requires RPG_ADMIN_TOKEN.'},status_code=403)
     return await call_next(request)
 
+
+@app.middleware('http')
+async def log_slow_requests(request, call_next):
+    """One line per request slower than RPG_SLOW_LOG_MS, with its section.
+
+    Added after `protect_changes`, so it is the outer middleware and its timing
+    includes the mutation guard. A streamed body (a file or a thumbnail) is
+    measured up to its headers only: FastAPI hands back the response before the
+    bytes are written.
+    """
+    started = time.perf_counter()
+    status = 500          # an exception leaves no response to read
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        if SLOW_LOG_MS > 0:
+            elapsed = (time.perf_counter() - started) * 1000
+            if elapsed >= SLOW_LOG_MS:
+                slow_log.info('slow %s %s section=%s %.0fms status=%d',
+                              request.method, request.url.path,
+                              request.query_params.get('section') or '-',
+                              elapsed, status)
+
+
 templates = Jinja2Templates(directory=os.path.join(BASE, 'templates'))
 app.mount('/static', StaticFiles(directory=os.path.join(BASE, 'static')),
           name='static')
@@ -209,9 +263,69 @@ templates.env.globals['cover_v'] = _cover_version
 templates.env.filters['filesize'] = human_size
 
 
-def db():
-    con = sqlite3.connect(DB, timeout=30)
+# SQLite starts every connection with a 2 MB page cache, no memory map and temp
+# tables on disk. That is invisible on a small database and painful on this one:
+# the catalogue is 3.66 GB, so a cold connection re-read the same hot pages for
+# every request. These pragmas are applied on every connection instead, and can
+# be changed from the environment (see README).
+_TEMP_STORE = {'DEFAULT': 0, 'FILE': 1, 'MEMORY': 2}
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """A non-negative integer from the environment, or the default if unusable."""
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def sqlite_settings() -> dict:
+    """The pragmas every catalogue connection gets, as {pragma: value}.
+
+    Read per connection rather than at import so a test or a restart can change
+    them without re-importing the module. Values are coerced to integers and
+    temp_store is a fixed vocabulary, so an environment typo cannot inject SQL.
+    """
+    temp = str(os.environ.get('RPG_SQLITE_TEMP_STORE', 'MEMORY')).strip().upper()
+    return {
+        # negative cache_size is KiB rather than pages: -65536 is 64 MB
+        'cache_size': -_env_int('RPG_SQLITE_CACHE_MB', 64, 1) * 1024,
+        'mmap_size': _env_int('RPG_SQLITE_MMAP_MB', 256) * 1024 * 1024,
+        'temp_store': _TEMP_STORE.get(temp, _TEMP_STORE['MEMORY']),
+        'busy_timeout': _env_int('RPG_SQLITE_BUSY_TIMEOUT_MS', 5000),
+    }
+
+
+def _connect(path: str, write: bool) -> sqlite3.Connection:
+    """Open the catalogue file, read-only unless the caller needs to change it."""
+    if not write and os.path.exists(path):
+        uri = 'file:' + quote(os.path.abspath(path)) + '?mode=ro'
+        try:
+            return sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError as exc:
+            # A WAL catalogue whose -shm is gone (an interrupted writer) cannot
+            # be opened read-only. Serving pages from a read-write handle beats
+            # failing every request until someone notices.
+            print(f'library: {path} is not readable read-only ({exc}); '
+                  'falling back to a read-write connection', file=sys.stderr)
+    # write=True, or no catalogue on disk yet: opening read-write keeps the app
+    # starting so the pages render (empty) instead of failing at connect time.
+    return sqlite3.connect(path)
+
+
+def db(write: bool = False) -> sqlite3.Connection:
+    """A catalogue connection carrying the tuned pragmas.
+
+    Reads use a read-only handle, so a GET that tries to mutate the catalogue
+    fails with 'attempt to write a readonly database' instead of quietly
+    splitting a write across connections. Only routes that change the catalogue
+    pass write=True.
+    """
+    con = _connect(DB, write)
     con.row_factory = sqlite3.Row
+    for name, value in sqlite_settings().items():
+        con.execute(f'PRAGMA {name}={int(value)}')
     return con
 
 
@@ -225,6 +339,43 @@ def fts_query(q: str) -> str:
     # drop FTS operators that would be interpreted as syntax
     terms = [t for t in terms if t.upper() not in ('AND', 'OR', 'NOT', 'NEAR')]
     return ' '.join(f'"{t}"*' for t in terms)
+
+
+# A prefix match on one or two characters matches most of the library, so the
+# files section keeps its substring scan for very short queries only.
+FTS_MIN_CHARS = 3
+
+
+def has_files_index(con) -> bool:
+    """Whether catalog.py has built files_fts yet."""
+    try:
+        return bool(con.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'files_fts'").fetchone())
+    except sqlite3.OperationalError:      # pragma: no cover - closed database
+        return False
+
+
+def files_filter(filters: str, params: list, q: str, match: str,
+                 use_fts: bool):
+    """WHERE clause for the "Books & assets" section of /search.
+
+    Longer queries use files_fts: LIKE '%q%' cannot use an index, so it read
+    every row of files and book_classification on each search. Short queries
+    keep the substring scan, and callers fall back to it as well when
+    files_fts has not been built yet.
+    """
+    clause, args = filters, list(params)
+    if q:
+        if use_fts:
+            clause += (' AND f.id IN (SELECT CAST(id AS INTEGER) FROM files_fts'
+                       ' WHERE files_fts MATCH ?)')
+            args.append(match)
+        else:
+            clause += (' AND (f.filename LIKE ? OR EXISTS(SELECT 1 FROM'
+                       ' book_classification b WHERE b.rel_path=f.rel_path AND'
+                       ' (b.system LIKE ? OR b.series LIKE ? OR b.campaign LIKE ?)))')
+            args += ['%' + q + '%'] * 4
+    return clause, args
 
 
 def highlight(snippet: str) -> str:
@@ -410,13 +561,14 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
     cw='EXISTS(SELECT 1 FROM files f WHERE f.collection_id=c.id AND '+filters+')'
     cp=list(params)
     fw=filters; fp=list(params)
+    use_fts=bool(match) and len(q.strip())>=FTS_MIN_CHARS and has_files_index(con)
     if q:
         cw+=' AND (c.name LIKE ? OR c.publisher LIKE ? OR c.family LIKE ?'
         cp += ['%'+q+'%']*3
         if match:
             cw+=' OR c.id IN (SELECT collection_id FROM search WHERE search MATCH ?)'; cp.append(match)
         cw+=')'
-        fw+=' AND (f.filename LIKE ? OR EXISTS(SELECT 1 FROM book_classification b WHERE b.rel_path=f.rel_path AND (b.system LIKE ? OR b.series LIKE ? OR b.campaign LIKE ?)))'; fp.extend(['%'+q+'%']*4)
+        fw,fp=files_filter(filters,params,q,match,use_fts)
     join=' FROM files f JOIN collections c ON c.id=f.collection_id WHERE '
     pw='pdf_fts MATCH ? AND '+filters; pp=[match]+params
     pj=' FROM pdf_fts p JOIN files f ON f.rel_path=p.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
@@ -1030,7 +1182,7 @@ def _run_index(rebuild: bool, workers: int = 3) -> None:
     rc = -1
     try:
         # Keep the indexer from starving the web app: the library is on a
-        # single spinning disk, so heavy parallel reads block everything else.
+        # single spinning disk, so give the indexing reads low I/O priority.
         import shutil
         launcher = []
         if shutil.which('ionice'):
@@ -1094,16 +1246,19 @@ def api_index_status(lines: int = 60):
     state['tail'] = _read_log_tail(INDEX_LOG, lines)
     try:
         con = db()
-        row = con.execute(
-            'SELECT COUNT(*) n, COALESCE(SUM(pages),0) p, '
-            'COALESCE(SUM(chars),0) c FROM pdf_status').fetchone()
-        state['indexed_files'] = row['n']
-        state['indexed_pages'] = row['p']
-        state['indexed_chars'] = row['c']
-        state['total_pdfs'] = con.execute(
-            "SELECT COUNT(*) c FROM files WHERE ext = '.pdf'").fetchone()['c']
-        con.close()
+        try:
+            row = con.execute(
+                'SELECT COUNT(*) n, COALESCE(SUM(pages),0) p, '
+                'COALESCE(SUM(chars),0) c FROM pdf_status').fetchone()
+            state['indexed_files'] = row['n']
+            state['indexed_pages'] = row['p']
+            state['indexed_chars'] = row['c']
+            state['total_pdfs'] = con.execute(
+                "SELECT COUNT(*) c FROM files WHERE ext = '.pdf'").fetchone()['c']
+        finally:
+            con.close()
     except sqlite3.OperationalError:
+        # no catalogue, or one that has never been indexed
         state.update(indexed_files=0, indexed_pages=0, indexed_chars=0,
                      total_pdfs=0)
     return JSONResponse(state)
@@ -1158,7 +1313,7 @@ async def edit_metadata(cid:int,request:Request):
     except (ValueError,TypeError):raise HTTPException(400,'Invalid cover page')
     try:
         with jobs.lease():
-            con=db()
+            con=db(write=True)
             try:
                 row=con.execute('SELECT rel_path,shelf FROM collections WHERE id=?',(cid,)).fetchone()
                 if not row:raise HTTPException(404,'Collection not found')
@@ -1185,11 +1340,16 @@ async def edit_metadata(cid:int,request:Request):
 
 @app.get('/classification')
 def classification_review(request:Request,all:bool=False):
-    con=db()
     import taxonomy
-    taxonomy.initialize(con)
-    rows=con.execute("SELECT c.*,a.source_shelf,a.rule,a.needs_review FROM collections c JOIN classification_audit a USING(rel_path) WHERE (? OR a.needs_review=1) ORDER BY c.name",(all,)).fetchall()
-    con.close()
+    con=db()
+    try:
+        # Creating the audit table is a no-op once it exists, which is the
+        # normal case: catalog.py builds it. A catalogue old enough to lack it
+        # needs one writable connection to catch up, not a writable route.
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name='classification_audit'").fetchone():
+            con.close();con=db(write=True);taxonomy.initialize(con)
+        rows=con.execute("SELECT c.*,a.source_shelf,a.rule,a.needs_review FROM collections c JOIN classification_audit a USING(rel_path) WHERE (? OR a.needs_review=1) ORDER BY c.name",(all,)).fetchall()
+    finally:con.close()
     return templates.TemplateResponse(request,'classification.html',{'rows':rows,'all':all,'shelf_label':shelf_label})
 
 
@@ -1248,7 +1408,7 @@ def explore(request:Request,q:str='',system:str='',edition:str='',role:str='',se
 
 @app.post('/api/book-metadata/{fid}')
 async def edit_book_metadata(fid:int,request:Request):
-    import classification,jobs,json
+    import catalog,classification,jobs,json
     data=await request.json()
     if not isinstance(data,dict):raise HTTPException(400,'Expected classification fields')
     fields={}
@@ -1262,13 +1422,14 @@ async def edit_book_metadata(fid:int,request:Request):
     if fields['volume'] is not None and not 1<=fields['volume']<=9999:raise HTTPException(400,'Invalid volume')
     try:
         with jobs.lease():
-            con=db()
+            con=db(write=True)
             try:
                 classification.initialize(con)
                 row=con.execute('SELECT rel_path FROM files WHERE id=?',(fid,)).fetchone()
                 if not row:raise HTTPException(404,'File not found')
                 con.execute('INSERT OR REPLACE INTO book_overrides VALUES (?,?)',(row['rel_path'],json.dumps(fields)))
                 con.execute('INSERT OR REPLACE INTO book_classification VALUES (?,?,?,?,?,?,?,?,?,?)',(row['rel_path'],fields['system'],fields['edition'],fields['series'],fields['campaign'],fields['volume'],fields['role'],'manual','Keeper annotation',classification.VERSION))
+                catalog.reindex_file(con,fid)
                 con.commit()
             finally:con.close()
     except RuntimeError as exc:raise HTTPException(409,str(exc))
