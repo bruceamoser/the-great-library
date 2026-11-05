@@ -31,12 +31,13 @@ CI runs the same command on every push and pull request.
 
 `tests/test_performance.py` is the search regression gate. It builds a synthetic
 catalogue, records every statement `/search` executes and the plan SQLite picks,
-and fails when a full scan or an eagerly paid count comes back. Rules that the
-code does not satisfy yet are listed in `PENDING` with the issue that has to
-land first: while such a rule fails the test is skipped with that issue named,
-so set `RPG_PERF_STRICT=1` to enforce them anyway and delete the entry once it
-passes (the test warns when that happens). `RPG_PERF_LATENCY_MS` overrides the
-250 ms per-section budget.
+and fails when a full scan or an eagerly paid count comes back. Every rule is
+enforced today and `PENDING` is empty. A rule the code cannot satisfy yet goes
+in `PENDING` with the issue that has to land first: while such a rule fails the
+test is skipped with that issue named, so set `RPG_PERF_STRICT=1` to enforce it
+anyway and delete the entry once it passes (the test warns when that happens).
+CI sets `RPG_PERF_STRICT=1`, so a pending rule does not skip the gate there.
+`RPG_PERF_LATENCY_MS` overrides the 250 ms per-section budget.
 
 ## Measuring search
 
