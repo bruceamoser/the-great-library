@@ -510,13 +510,18 @@ def search_total(key, compute):
         if hit and hit[0] > now:
             return hit[1]
     value = compute()
+    # The window starts when the count *finishes*, not when it was asked for:
+    # the content total takes 16 s on the live HDD catalogue, and timing it from
+    # the start would quietly shorten the advertised minute to 44 s for exactly
+    # the total this cache exists to avoid recomputing.
+    stored = time.monotonic()
     with _search_totals_lock:
         if len(_search_totals) >= SEARCH_TOTAL_CACHE_MAX:
-            for stale in [k for k, v in _search_totals.items() if v[0] <= now]:
+            for stale in [k for k, v in _search_totals.items() if v[0] <= stored]:
                 del _search_totals[stale]
             while len(_search_totals) >= SEARCH_TOTAL_CACHE_MAX:
                 _search_totals.pop(next(iter(_search_totals)))
-        _search_totals[key] = (now + SEARCH_TOTAL_TTL, value)
+        _search_totals[key] = (stored + SEARCH_TOTAL_TTL, value)
     return value
 
 

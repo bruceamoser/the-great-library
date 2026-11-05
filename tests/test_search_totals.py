@@ -126,6 +126,35 @@ class SearchTotals(unittest.TestCase):
         # contract this test is about.
         self.assertEqual(response.status_code, 200)
 
+    def test_cache_window_starts_when_the_count_finishes(self):
+        """A slow count keeps the whole TTL after it, not what is left of it.
+
+        The content total takes 16 s on the live HDD catalogue. Stamping the
+        entry when the count was *asked for* left that total -- the expensive
+        one this cache exists for -- with 44 s of cache instead of the 60 the
+        constant and the comment promise.
+        """
+        import app
+        app.clear_search_totals()
+        key = (str(self.db), 'content', 'dragon', '', '', '', '', '')
+        clock = [1000.0]
+
+        def slow_count():
+            clock[0] += 16.0                       # the count itself
+            return 42
+
+        with patch.object(app.time, 'monotonic', lambda: clock[0]):
+            self.assertEqual(app.search_total(key, slow_count), 42)
+            self.assertEqual(app._search_totals[key][0],
+                             1016.0 + app.SEARCH_TOTAL_TTL)
+            # still a hit one second before the window closes ...
+            clock[0] = 1016.0 + app.SEARCH_TOTAL_TTL - 1
+            self.assertEqual(
+                app.search_total(key, lambda: self.fail('recomputed inside the TTL')), 42)
+            # ... and a miss once it has
+            clock[0] = 1016.0 + app.SEARCH_TOTAL_TTL
+            self.assertEqual(app.search_total(key, lambda: 7), 7)
+
     def test_total_cache_stays_bounded(self):
         import app
         app.clear_search_totals()
