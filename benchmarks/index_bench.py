@@ -258,7 +258,7 @@ def main(argv=None):
             minutes = seconds / 60
             payload['projection'] = {
                 'configuration': best['configuration'],
-                'library_mib': round(total, 1),
+                'library_mib': round(total, 3),
                 'extraction_seconds': round(seconds, 3),
                 'extraction_minutes': round(minutes, 1)}
             if not args.json:

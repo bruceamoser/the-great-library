@@ -67,8 +67,10 @@ class IndexBenchTests(unittest.TestCase):
         self.assertEqual(data['pages'], sum(PAGES_PER_FILE))
         self.assertEqual(len(data['configurations']), 2)  # streamed + inplace
         for row in data['configurations']:
+            # pages/s rather than the rounded seconds: a fast machine times a
+            # 20-page corpus at a few milliseconds, which rounds to 0.0 s.
             self.assertGreater(row['pages_s'], 0)
-            self.assertGreater(row['median_s'], 0)
+            self.assertGreaterEqual(row['median_s'], 0)
 
     def test_streamed_and_inplace_extract_the_same_text(self):
         # The benchmark exits non-zero if the configurations disagree, so a
@@ -100,13 +102,25 @@ class IndexBenchTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.library.iterdir()), before)
         self.assertEqual([p for p in self.library.rglob('*.db')], [])
 
-    def test_projection_covers_the_whole_library(self):
+    def test_projection_applies_the_measured_rate_to_the_whole_library(self):
+        # Asserting "the projection is positive" makes the test depend on how
+        # fast the machine is: on a quick one a five-file corpus projects to
+        # 0.0002 s, which rounds to zero. What matters is that the figure is
+        # the measured rate applied to the library's real size.
         result = self.run_bench('--workers', '1', '--rounds', '1',
                                 '--sample', '2', '--json')
-        projection = json.loads(result.stdout)['projection']
-        self.assertGreaterEqual(projection['library_mib'],
-                                json.loads(result.stdout)['sample_mib'])
-        self.assertGreater(projection['extraction_seconds'], 0)
+        data = json.loads(result.stdout)
+        projection = data['projection']
+        self.assertGreaterEqual(projection['library_mib'], data['sample_mib'])
+        rate = next(row for row in data['configurations']
+                    if row['configuration'] == projection['configuration'])
+        self.assertGreater(rate['mib_s'], 0)
+        # Both fields are rounded for display, so compare with a tolerance
+        # rather than exactly.
+        expected = projection['library_mib'] / rate['mib_s']
+        self.assertAlmostEqual(
+            projection['extraction_seconds'], expected,
+            delta=max(0.01, expected * 0.1))
 
     def test_rejects_a_missing_library(self):
         result = subprocess.run(
