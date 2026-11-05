@@ -227,6 +227,34 @@ def fts_query(q: str) -> str:
     return ' '.join(f'"{t}"*' for t in terms)
 
 
+# A prefix match on one or two characters matches most of the library, so the
+# files section keeps its substring scan for very short queries only.
+FTS_MIN_CHARS = 3
+
+
+def files_filter(filters: str, params: list, q: str, match: str,
+                 use_fts: bool):
+    """WHERE clause for the "Books & assets" section of /search.
+
+    Longer queries use files_fts: LIKE '%q%' cannot use an index, so it read
+    every row of files and book_classification on each search. Short queries
+    keep the substring scan, and callers fall back to it as well when
+    files_fts has not been built yet.
+    """
+    clause, args = filters, list(params)
+    if q:
+        if use_fts:
+            clause += (' AND f.id IN (SELECT CAST(id AS INTEGER) FROM files_fts'
+                       ' WHERE files_fts MATCH ?)')
+            args.append(match)
+        else:
+            clause += (' AND (f.filename LIKE ? OR EXISTS(SELECT 1 FROM'
+                       ' book_classification b WHERE b.rel_path=f.rel_path AND'
+                       ' (b.system LIKE ? OR b.series LIKE ? OR b.campaign LIKE ?)))')
+            args += ['%' + q + '%'] * 4
+    return clause, args
+
+
 def highlight(snippet: str) -> str:
     """Escape a snippet, then turn the << >> markers into <mark> tags."""
     escaped = html_lib.escape(snippet or '')
@@ -360,13 +388,14 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
     cw='EXISTS(SELECT 1 FROM files f WHERE f.collection_id=c.id AND '+filters+')'
     cp=list(params)
     fw=filters; fp=list(params)
+    use_fts=bool(match) and len(q.strip())>=FTS_MIN_CHARS
     if q:
         cw+=' AND (c.name LIKE ? OR c.publisher LIKE ? OR c.family LIKE ?'
         cp += ['%'+q+'%']*3
         if match:
             cw+=' OR c.id IN (SELECT collection_id FROM search WHERE search MATCH ?)'; cp.append(match)
         cw+=')'
-        fw+=' AND (f.filename LIKE ? OR EXISTS(SELECT 1 FROM book_classification b WHERE b.rel_path=f.rel_path AND (b.system LIKE ? OR b.series LIKE ? OR b.campaign LIKE ?)))'; fp.extend(['%'+q+'%']*4)
+        fw,fp=files_filter(filters,params,q,match,use_fts)
     import campaigns
     campaign_items=campaigns.catalog(con)
     eligible={r[0] for r in con.execute('SELECT c.id FROM collections c WHERE '+('EXISTS(SELECT 1 FROM files f WHERE f.collection_id=c.id AND '+filters+')'),params)}
@@ -374,7 +403,14 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
     totals={'campaigns':len(campaign_items)}
     totals['collections']=con.execute('SELECT COUNT(*) FROM collections c WHERE '+cw,cp).fetchone()[0]
     join=' FROM files f JOIN collections c ON c.id=f.collection_id WHERE '
-    totals['files']=con.execute('SELECT COUNT(*)'+join+fw,fp).fetchone()[0]
+    try:
+        totals['files']=con.execute('SELECT COUNT(*)'+join+fw,fp).fetchone()[0]
+    except sqlite3.OperationalError:
+        # catalog.py builds files_fts. Until the next rescan it may be absent;
+        # the files section then keeps working on the substring scan.
+        use_fts=False
+        fw,fp=files_filter(filters,params,q,match,use_fts)
+        totals['files']=con.execute('SELECT COUNT(*)'+join+fw,fp).fetchone()[0]
     pw='pdf_fts MATCH ? AND '+filters; pp=[match]+params
     pj=' FROM pdf_fts JOIN pdf_pages pp ON pp.id=pdf_fts.rowid JOIN files f ON f.rel_path=pp.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
     index_available=True
@@ -1188,7 +1224,7 @@ def explore(request:Request,q:str='',system:str='',edition:str='',role:str='',se
 
 @app.post('/api/book-metadata/{fid}')
 async def edit_book_metadata(fid:int,request:Request):
-    import classification,jobs,json
+    import catalog,classification,jobs,json
     data=await request.json()
     if not isinstance(data,dict):raise HTTPException(400,'Expected classification fields')
     fields={}
@@ -1209,6 +1245,7 @@ async def edit_book_metadata(fid:int,request:Request):
                 if not row:raise HTTPException(404,'File not found')
                 con.execute('INSERT OR REPLACE INTO book_overrides VALUES (?,?)',(row['rel_path'],json.dumps(fields)))
                 con.execute('INSERT OR REPLACE INTO book_classification VALUES (?,?,?,?,?,?,?,?,?,?)',(row['rel_path'],fields['system'],fields['edition'],fields['series'],fields['campaign'],fields['volume'],fields['role'],'manual','Keeper annotation',classification.VERSION))
+                catalog.reindex_file(con,fid)
                 con.commit()
             finally:con.close()
     except RuntimeError as exc:raise HTTPException(409,str(exc))
