@@ -55,6 +55,11 @@ scratch path; without it the catalogue is built in a temp dir and deleted. Judge
 a change against the same size and query as the run before it — the default
 query matches about 1 page in 20, the scale at which a content count hurts.
 
+Each section is reported twice: `cold`, with the totals cache emptied first, and
+the percentiles of repeats inside the 60 s TTL that holds each total. Only the
+rendered section computes a total, so `cold` is the expensive column — on a
+small catalogue the two are close, and on the live one they are not.
+
 Any request slower than `RPG_SLOW_LOG_MS` (default 250 ms, `0` turns it off)
 writes one stderr line from the `rpg.slow` logger:
 
