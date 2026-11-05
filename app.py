@@ -9,6 +9,7 @@ only (see run.sh).
 Run:  ./.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8765
 """
 import html as html_lib
+import logging
 import mimetypes
 import os
 import re
@@ -35,6 +36,33 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 LIBRARY = os.environ.get('RPG_LIBRARY', '/mnt/disk5/RPG-Library')
 DB = os.environ.get('RPG_DB', os.path.join(BASE, 'library.db'))
 CATALOG_PY = os.path.join(BASE, 'catalog.py')
+
+
+def _env_ms(name: str, default: float) -> float:
+    """A millisecond budget from the environment; junk falls back to `default`."""
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# One stderr line for any request slower than this; 0 turns the log off.
+# Without it the slow paths are invisible until a page visibly hangs: a content
+# total over 300k indexed pages was once measured at 16 s on the host's disk.
+SLOW_LOG_MS = _env_ms('RPG_SLOW_LOG_MS', 250.0)
+slow_log = logging.getLogger('rpg.slow')
+slow_log.setLevel(logging.INFO)
+if not slow_log.handlers:
+    # uvicorn configures only its own loggers, so the root logger has no
+    # handler and an INFO record would vanish. Give this logger its own:
+    # stderr goes to the journal under systemd, and nothing needs configuring.
+    _slow_handler = logging.StreamHandler(sys.stderr)
+    _slow_handler.setFormatter(logging.Formatter('%(message)s'))
+    slow_log.addHandler(_slow_handler)
+    slow_log.propagate = False
 
 # Cached downscaled images. The library holds map scans up to 184 MB and
 # 20064x13082 pixels; decoding one of those in the browser takes seconds and
@@ -192,6 +220,32 @@ async def protect_changes(request, call_next):
             if not local and not (token and secrets.compare_digest(request.headers.get('x-library-admin',''),token)):
                 return JSONResponse({'error':'Maintenance is available on the library host. Remote administration requires RPG_ADMIN_TOKEN.'},status_code=403)
     return await call_next(request)
+
+
+@app.middleware('http')
+async def log_slow_requests(request, call_next):
+    """One line per request slower than RPG_SLOW_LOG_MS, with its section.
+
+    Added after `protect_changes`, so it is the outer middleware and its timing
+    includes the mutation guard. A streamed body (a file or a thumbnail) is
+    measured up to its headers only: FastAPI hands back the response before the
+    bytes are written.
+    """
+    started = time.perf_counter()
+    status = 500          # an exception leaves no response to read
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        if SLOW_LOG_MS > 0:
+            elapsed = (time.perf_counter() - started) * 1000
+            if elapsed >= SLOW_LOG_MS:
+                slow_log.info('slow %s %s section=%s %.0fms status=%d',
+                              request.method, request.url.path,
+                              request.query_params.get('section') or '-',
+                              elapsed, status)
+
 
 templates = Jinja2Templates(directory=os.path.join(BASE, 'templates'))
 app.mount('/static', StaticFiles(directory=os.path.join(BASE, 'static')),

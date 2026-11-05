@@ -174,6 +174,27 @@ class LibraryTests(unittest.TestCase):
         r=c.get('/search?q=dragon&cat=book&section=files');self.assertEqual(r.status_code,200);self.assertIn('dragon-notes.txt</a>',r.text)
         self.assertEqual(c.get('/search?q=AND&section=content').status_code,200)
         self.assertEqual(c.get('/search?page=-5').status_code,200)
+    def test_slow_request_log_is_one_line_and_switchable(self):
+        import app
+        c=self.client()
+        # A lower threshold than any real request makes the log deterministic;
+        # 0 (the documented off switch) is checked by the second half.
+        with patch.object(app,'SLOW_LOG_MS',0.000001),self.assertLogs('rpg.slow',level='INFO') as logs:
+            self.assertEqual(c.get('/search?q=dragon&section=files').status_code,200)
+        self.assertEqual(len(logs.output),1)
+        line=logs.output[0]
+        self.assertIn('GET /search',line);self.assertIn('section=files',line)
+        self.assertIn('status=200',line);self.assertRegex(line,r'\b\d+ms status=200$')
+        with patch.object(app,'SLOW_LOG_MS',0),patch.object(app.slow_log,'info') as info:
+            self.assertEqual(c.get('/search?q=dragon&section=content').status_code,200)
+            info.assert_not_called()
+        with patch.object(app,'SLOW_LOG_MS',60000),patch.object(app.slow_log,'info') as info:
+            self.assertEqual(c.get('/search?q=dragon&section=files').status_code,200)
+            info.assert_not_called()
+        # The log wraps the mutation guard, so a refused POST is timed too.
+        with patch.object(app,'SLOW_LOG_MS',0.000001),self.assertLogs('rpg.slow',level='INFO') as logs:
+            self.assertEqual(c.post('/api/rescan').status_code,403)
+        self.assertEqual(len(logs.output),1);self.assertIn('status=403',logs.output[0])
     def test_suffix_ranges_and_unicode_filename(self):
         c=self.client();fid=self.query("select id from files where filename='dragon-notes.txt'")[0][0]
         r=c.get('/raw/'+str(fid),headers={'Range':'bytes=-2'});self.assertEqual(r.status_code,206);self.assertEqual(r.content,b'es')
