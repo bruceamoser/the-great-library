@@ -11,8 +11,11 @@ script builds a catalogue of a chosen size and times the real endpoint.
 It writes a synthetic catalogue using the *real* schemas -- `catalog.SCHEMA`,
 `index_pdf_text.SCHEMA`, and the tables `classification`/`taxonomy`/`metadata`
 create -- into a throwaway SQLite file, then drives `/search` through FastAPI's
-in-process test client once per section. Nothing is read from the library, no
-server is started and no socket is opened.
+in-process test client once per section. The search indexes are filled through
+the same functions a rescan uses (`catalog.rebuild_files_fts`,
+`index_pdf_text.ensure_schema`), so the benchmark exercises the query paths the
+live catalogue takes rather than their empty-index fallbacks. Nothing is read
+from the library, no server is started and no socket is opened.
 
 Usage:
   .venv/bin/python benchmarks/search_bench.py
@@ -227,11 +230,19 @@ def build_catalogue(db_path, files, pages, collections, query='', seed=1234):
             con.executemany('INSERT INTO pdf_fts VALUES (?,?,?)', batch)
             written += len(batch)
         con.commit()
+        # The real indexer keeps a rowid map beside pdf_fts; without it the
+        # catalogue is not the shape a rescan produces.
+        index_pdf_text.ensure_schema(con)
+        # catalog.py fills files_fts at the end of a scan. Leaving it empty
+        # would send a 3+ character query down the FTS path with no rows to
+        # find, so the files section would time an empty result set.
+        files_indexed = catalog.rebuild_files_fts(con)
+        con.commit()
         con.execute('PRAGMA optimize')
     finally:
         con.close()
     return {'files': files, 'pages': written, 'collections': collections,
-            'pdf_files': len(pdf_files)}
+            'pdf_files': len(pdf_files), 'files_indexed': files_indexed}
 
 
 # --------------------------------------------------------------- measuring ---
@@ -364,7 +375,8 @@ def main(argv=None):
 
     print(f"synthetic catalogue  {shape['files']:,} files  "
           f"{shape['pages']:,} pages  {shape['collections']:,} collections"
-          f"  (built in {build_seconds:.1f} s)")
+          f"  ({shape['files_indexed']:,} in files_fts, "
+          f"built in {build_seconds:.1f} s)")
     print(f"query                {args.query!r}   "
           f"{args.runs} run(s), {args.warmup} warm-up")
     print(f"db                   {db_path}"

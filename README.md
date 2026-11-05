@@ -717,14 +717,24 @@ for `index_pdf_text.py` rather than relying only on its own job registry.
 `/search` is the slowest surface in the app, and on the live catalogue its
 slowest query is the **total**, not the page of results: on 2026-11-04, on the
 host's spinning disk, a content count over 309,790 indexed pages took 16,006 ms
-where the same count on NVMe took 70 ms. Two tools make that measurable instead
-of guesswork.
+where the same count on NVMe took 70 ms. Three tools make that measurable instead
+of guesswork: a regression gate in the test suite, a benchmark you run by hand,
+and a line the server writes in production.
 
-**`benchmarks/search_bench.py`** builds a synthetic catalogue using the real
-schemas (`catalog.SCHEMA`, `index_pdf_text.SCHEMA`, and the tables
-`classification`/`taxonomy`/`metadata` create) in a throwaway SQLite file, then
-drives the actual `/search` route through FastAPI's in-process test client, once
-per section. No library data, no server started, no network.
+`tests/test_performance.py` is the gate: it records every statement `/search`
+executes and the plan SQLite picks, and fails when a full scan or an eagerly paid
+count comes back. It runs in CI and answers "did this change make a query scan?",
+not "how long does a section take".
+
+**`benchmarks/search_bench.py`** answers the second question. It builds a
+synthetic catalogue using the real schemas (`catalog.SCHEMA`,
+`index_pdf_text.SCHEMA`, and the tables `classification`/`taxonomy`/`metadata`
+create) in a throwaway SQLite file, then drives the actual `/search` route
+through FastAPI's in-process test client, once per section. The search indexes
+are filled through the same functions a rescan calls
+(`catalog.rebuild_files_fts`, `index_pdf_text.ensure_schema`), so the timings
+cover the FTS query paths rather than their empty-index fallbacks. No library
+data, no server started, no network.
 
 ```sh
 .venv/bin/python benchmarks/search_bench.py                        # 5,000 files / 50,000 pages
@@ -733,15 +743,15 @@ per section. No library data, no server started, no network.
 ```
 
 ```
-synthetic catalogue  5,000 files  50,000 pages  152 collections  (built in 0.6 s)
+synthetic catalogue  5,000 files  50,000 pages  152 collections  (5,000 in files_fts, built in 0.6 s)
 query                'dragon'   5 run(s), 1 warm-up
-db                   /tmp/rpg-search-bench-y_uw2zo4/bench.db (deleted)
+db                   /tmp/rpg-search-bench-hgxy0yok/bench.db (deleted)
 
 section         p50 ms    p95 ms    min ms    max ms
-collections       42.3      43.7      41.6      44.0
-files             45.1      46.5      43.9      46.9
-content           60.3      64.3      58.7      64.8
-campaigns         60.0      60.9      59.6      61.2
+collections       41.2      41.7      40.5      41.7
+files             41.1      43.4      39.8      43.5
+content           61.1      62.6      57.4      62.9
+campaigns         60.7      65.6      60.4      66.7
 ```
 
 Each number is a whole request, template rendering included, because that is
