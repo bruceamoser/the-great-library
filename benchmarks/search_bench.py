@@ -9,10 +9,11 @@ took 70 ms on NVMe. Judging an optimisation from there is guesswork, so this
 script builds a catalogue of a chosen size and times the real endpoint.
 
 It writes a synthetic catalogue using the *real* schemas -- `catalog.SCHEMA`,
-`index_pdf_text.SCHEMA`, and the tables `classification`/`taxonomy`/`metadata`
-create -- into a throwaway SQLite file, then drives `/search` through FastAPI's
-in-process test client once per section. The search indexes are filled through
-the same functions a rescan uses (`catalog.rebuild_files_fts`,
+the `pdf_pages`/`pdf_fts`/`pdf_status` index `index_pdf_text.ensure_schema`
+creates, and the tables `classification`/`taxonomy`/`metadata` create -- into a
+throwaway SQLite file, then drives `/search` through FastAPI's in-process test
+client once per section. The search indexes are filled through the same
+functions a rescan uses (`catalog.rebuild_files_fts`,
 `index_pdf_text.ensure_schema`), so the benchmark exercises the query paths the
 live catalogue takes rather than their empty-index fallbacks. Nothing is read
 from the library, no server is started and no socket is opened.
@@ -129,7 +130,7 @@ def build_catalogue(db_path, files, pages, collections, query='', seed=1234):
     con = sqlite3.connect(str(db_path), timeout=30)
     try:
         con.executescript(catalog.SCHEMA)          # collections, files, search
-        con.executescript(index_pdf_text.SCHEMA)   # pdf_fts, pdf_status
+        index_pdf_text.ensure_schema(con)          # pdf_pages, pdf_fts, pdf_status
         # The tables /search reads when the query is not empty: the per-file
         # classification filter and the campaign cards.
         classification.initialize(con)
@@ -223,16 +224,15 @@ def build_catalogue(db_path, files, pages, collections, query='', seed=1234):
                           i // len(pdf_files) + 1,
                           _word_text(rng, keyword, HITS_IN)))
             if len(batch) >= 2000:
-                con.executemany('INSERT INTO pdf_fts VALUES (?,?,?)', batch)
+                con.executemany('INSERT INTO pdf_pages(rel_path,page,text) '
+                                'VALUES (?,?,?)', batch)
                 written += len(batch)
                 batch = []
         if batch:
-            con.executemany('INSERT INTO pdf_fts VALUES (?,?,?)', batch)
+            con.executemany('INSERT INTO pdf_pages(rel_path,page,text) '
+                            'VALUES (?,?,?)', batch)
             written += len(batch)
         con.commit()
-        # The real indexer keeps a rowid map beside pdf_fts; without it the
-        # catalogue is not the shape a rescan produces.
-        index_pdf_text.ensure_schema(con)
         # catalog.py fills files_fts at the end of a scan. Leaving it empty
         # would send a 3+ character query down the FTS path with no rows to
         # find, so the files section would time an empty result set.

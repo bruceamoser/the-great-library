@@ -7,7 +7,7 @@ The Reading Desk saves collections, PDF positions, bookmarks, and notes **in the
 ## Reliability and maintenance
 
 - Catalog rescans are transactional, preserve existing path IDs, and never recycle removed IDs. Source books and folders are not moved by classification.
-- PDF indexing replaces each processed book's old pages, with a rowid map for efficient cleanup. A failed extraction is reported and retains the prior index for that book.
+- PDF indexing replaces each processed book's old pages. Page text is stored once in `pdf_pages`; `pdf_fts` indexes it by integer rowid as an external-content FTS5 table. `index_pdf_text.py --migrate --vacuum` upgrades an existing index in place, preserves `pdf_status`, and reclaims the free pages left by earlier delete/insert cycles. A failed extraction is reported and retains the prior index for that book.
 - PyMuPDF rendering runs in an isolated process under a cross-process lock. Busy thumbnail requests return a retryable response instead of blocking the request pool. Browser thumbnails retry briefly. Bulk thumbnail jobs are not automatically started.
 - Maintenance jobs use one filesystem lease across CLI and web tasks, with durable JSON records. Sync stops on the first failed stage.
 - Mutating APIs require the same-origin interface header. Maintenance and metadata changes require loopback access, or `RPG_ADMIN_TOKEN` and an `X-Library-Admin` header. LAN browsing remains available. Use the host's localhost URL for editing.

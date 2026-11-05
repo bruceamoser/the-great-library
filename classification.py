@@ -196,7 +196,7 @@ if __name__=='__main__':
    try:
     # Existing extracted text only: no PDF parsing, networking, or OCR work.
     titles=defaultdict(list)
-    for r in con.execute('SELECT rel_path,page,substr(text,1,1800) text FROM pdf_fts WHERE CAST(page AS INTEGER)<=2'):
+    for r in con.execute('SELECT rel_path,page,substr(text,1,1800) text FROM pdf_pages WHERE page<=2'):
      titles[r['rel_path']].append((int(r['page']),r['text']))
     for path,parts in titles.items():con.execute('INSERT OR REPLACE INTO book_title_evidence VALUES (?,0,?)',(path,'\n'.join(t for _,t in sorted(parts))[:3600]))
    except sqlite3.OperationalError:pass

@@ -31,8 +31,9 @@ class SearchTotals(unittest.TestCase):
     def content_total(self, q):
         """The same join the route uses, asked of the catalogue directly."""
         return self.rows(
-            """SELECT COUNT(*) FROM pdf_fts p
-               JOIN files f ON f.rel_path = p.rel_path
+            """SELECT COUNT(*) FROM pdf_fts
+               JOIN pdf_pages pp ON pp.id = pdf_fts.rowid
+               JOIN files f ON f.rel_path = pp.rel_path
                JOIN collections c ON c.id = f.collection_id
                WHERE pdf_fts MATCH ?""", (q,))[0][0]
 

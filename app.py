@@ -390,12 +390,13 @@ def content_search(con, q: str, limit: int = 60):
         return []
     try:
         return con.execute(
-            """SELECT f.id AS fid, p.page AS page, f.filename AS filename,
+            """SELECT f.id AS fid, pp.page AS page, f.filename AS filename,
                       f.collection_id AS cid, c.name AS collection_name,
                       c.shelf AS shelf,
-                      snippet(pdf_fts, 2, '<<', '>>', ' … ', 14) AS snip
-               FROM pdf_fts p
-               JOIN files f ON f.rel_path = p.rel_path
+                      snippet(pdf_fts, 0, '<<', '>>', ' … ', 14) AS snip
+               FROM pdf_fts
+               JOIN pdf_pages pp ON pp.id = pdf_fts.rowid
+               JOIN files f ON f.rel_path = pp.rel_path
                JOIN collections c ON c.id = f.collection_id
                WHERE pdf_fts MATCH ?
                ORDER BY rank LIMIT ?""", (fts_query(q), limit)).fetchall()
@@ -534,9 +535,16 @@ def count_rows(con, sql, args=()):
 
 
 def has_pdf_index(con) -> bool:
+    """True when both halves of the external-content PDF index are present.
+
+    `pdf_fts` is external content over `pdf_pages`; an old-style database still
+    has a `pdf_fts` but no content table, and is treated as not indexed until
+    `index_pdf_text.py --migrate` has run.
+    """
     try:
-        return bool(con.execute(
-            "SELECT 1 FROM sqlite_master WHERE name = 'pdf_fts'").fetchone())
+        names = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('pdf_fts', 'pdf_pages')")}
+        return {'pdf_fts', 'pdf_pages'} <= names
     except sqlite3.OperationalError:      # pragma: no cover - closed database
         return False
 
@@ -571,7 +579,7 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         fw,fp=files_filter(filters,params,q,match,use_fts)
     join=' FROM files f JOIN collections c ON c.id=f.collection_id WHERE '
     pw='pdf_fts MATCH ? AND '+filters; pp=[match]+params
-    pj=' FROM pdf_fts p JOIN files f ON f.rel_path=p.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
+    pj=' FROM pdf_fts JOIN pdf_pages pp ON pp.id=pdf_fts.rowid JOIN files f ON f.rel_path=pp.rel_path JOIN collections c ON c.id=f.collection_id WHERE '
     index_available=has_pdf_index(con)
     # Only the rendered tab needs a total; the other three cost seconds and are
     # never displayed (the template omits their badges).
@@ -601,7 +609,7 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         order='f.size DESC,f.id' if sort=='size' else 'f.filename COLLATE NOCASE,f.id'
         files=con.execute('SELECT f.*,c.name collection_name,c.shelf'+join+fw+' ORDER BY '+order+' LIMIT ? OFFSET ?',fp+[size,offset]).fetchall()
     elif match and index_available:
-        content_hits=con.execute("SELECT f.id fid,p.page,f.filename,c.id cid,c.name collection_name,c.shelf,snippet(pdf_fts,2,'<<','>>',' … ',24) snip"+pj+pw+' ORDER BY rank LIMIT ? OFFSET ?',pp+[size,offset]).fetchall()
+        content_hits=con.execute("SELECT f.id fid,pp.page,f.filename,c.id cid,c.name collection_name,c.shelf,snippet(pdf_fts,0,'<<','>>',' … ',24) snip"+pj+pw+' ORDER BY rank LIMIT ? OFFSET ?',pp+[size,offset]).fetchall()
     all_tags=con.execute('SELECT name FROM tags ORDER BY name').fetchall()
     shelves=con.execute('SELECT DISTINCT shelf FROM collections ORDER BY shelf').fetchall()
     con.close()

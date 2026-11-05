@@ -34,7 +34,7 @@ class SearchBenchTests(unittest.TestCase):
             con=sqlite3.connect(path)
             try:
                 self.assertEqual(con.execute('select count(*) from files_fts').fetchone()[0],200)
-                self.assertEqual(con.execute('select count(*) from pdf_page_map').fetchone()[0],400)
+                self.assertEqual(con.execute('select count(*) from pdf_pages').fetchone()[0],400)
                 # Prove the index actually matches a file, not just that rows
                 # exist: take a word from a real filename and search for it.
                 filename=con.execute('select filename from files_fts limit 1').fetchone()[0]

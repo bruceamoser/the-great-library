@@ -36,10 +36,10 @@ Keeping the fixture honest
 --------------------------
 
 The catalogue is built from the production schemas - ``catalog.SCHEMA``,
-``classification``/``taxonomy``/``metadata`` and ``index_pdf_text.SCHEMA`` - so
-a schema change shows up here as a failure to build rather than as a test with
-nothing to measure.  When #6 replaces ``pdf_fts`` with an integer-keyed,
-external-content index, ``_pdf_pages()`` is the function that has to change.
+``classification``/``taxonomy``/``metadata`` and the ``pdf_pages`` +
+``pdf_fts`` index ``index_pdf_text.ensure_schema`` creates - so a schema change
+shows up here as a failure to build rather than as a test with nothing to
+measure.
 """
 
 import os
@@ -209,7 +209,7 @@ def build_catalogue(db_path):
         taxonomy.initialize(con)
         metadata.initialize(con)
         classification.initialize(con)
-        con.executescript(index_pdf_text.SCHEMA)
+        index_pdf_text.ensure_schema(con)
         collections, files, classified = [], [], []
         file_id = 0
         for index in range(COLLECTIONS):
@@ -252,7 +252,7 @@ def build_catalogue(db_path):
             [(row[0], row[4], row[1], '', f'Game {row[0]:02d}') for row in collections])
         # The content index: one page row per entry, spread over every file.
         con.executemany(
-            'INSERT INTO pdf_fts(rel_path,page,text) VALUES(?,?,?)',
+            'INSERT INTO pdf_pages(rel_path,page,text) VALUES(?,?,?)',
             [(files[index % len(files)][2], index % 200 + 1,
               f'{PDF_TEXT} page {index}') for index in range(PDF_PAGES)])
         builder = getattr(catalog, 'rebuild_files_fts', None)

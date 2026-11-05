@@ -434,7 +434,7 @@ Measured on this machine, full rebuild of the restructured library
 | Processed | **5,064** in 4,341 s (72 min) at 3 workers |
 | Throughput | **~1.2 files/s, ~73 pages/s** |
 | Pages extracted | **317,898** from 997.5 M characters |
-| Index size | `library.db` ≈ 1.9 GB (`pdf_fts` = 307,978 rows) |
+| Index size | `library.db` ≈ 1.9 GB (`pdf_pages` = 307,978 rows) |
 | Image-only PDFs | **295 (5.8%)** — no text layer, unsearchable without OCR |
 | Hard failures | **2** — both pre-existing zero-byte PDFs in the source export |
 | Stale rows pruned | 4,896 (correctly removed after the restructure renamed every path) |
@@ -444,6 +444,35 @@ order. Reading each file as one sequential stream and parsing it from memory is
 ~3.9–5.3× faster at the same worker count, so the same rebuild should take
 **~16–20 min** rather than 72. See *Why three workers, and why streamed reads*
 below.
+
+### Upgrade an existing index
+
+Older databases stored the path and page number on every `pdf_fts` row and
+joined hits back to `files` on a string. The index is now `pdf_pages` (one row
+per page, integer `id`) plus `pdf_fts` as an **external-content** FTS5 table
+over `pdf_pages.text`, with triggers keeping the two in sync. Upgrading copies
+the text out of the old table, rebuilds the index and drops the obsolete
+`pdf_page_map`:
+
+```sh
+cd /mnt/disk5/rpg-app
+ionice -c2 -n7 nice -n 19 ./.venv/bin/python index_pdf_text.py \
+    --library /mnt/disk5/RPG-Library --db library.db --migrate --vacuum
+```
+
+`--migrate` is idempotent (a second run does nothing) and every indexing run
+also performs it automatically. `--vacuum` rewrites the database and reports
+the size before and after; on the host database that is where the ~1.7 GB of
+free pages left by earlier delete/insert cycles is reclaimed. No PDF is
+re-extracted unless `--rebuild` is also given.
+
+Deploy the new code first: until the migration runs, the app treats the content
+index as absent and simply shows no inside-book results. The migration itself
+copies every page once, so keep the same `ionice`/`nice` wrapper and allow a
+few minutes; `--vacuum` additionally needs temporary free space roughly equal
+to the final database size (~2 GB). Run it at a quiet moment: if SQLite reports
+the database is locked during `VACUUM`, re-run the same command — the schema
+upgrade is already committed and is skipped, and only the VACUUM is retried.
 
 A full rebuild takes tens of minutes because every PDF must be re-extracted;
 an incremental run only touches files whose mtime changed.
@@ -458,7 +487,7 @@ compete. Measured cost of each part, for an index the size of the real one
 | Stage | Cost | Share of a 72-min run |
 |---|---|---|
 | Reading and extracting the PDFs (3 workers) | ~69 min | **~96%** |
-| Writing every page into `pdf_fts` | ~35 s | 0.8% |
+| Writing every page into `pdf_pages` | ~35 s | 0.8% |
 | Trailing `INSERT INTO pdf_fts(pdf_fts) VALUES('optimize')` | ~5 s | 0.1% |
 | Pruning stale rows | ~0.4 s | — |
 
@@ -542,10 +571,11 @@ rebuild* to force everything.
 ### Notes
 
 - Extraction uses **PyMuPDF**; `pypdf` is ~20x slower and stalls on large files.
-- The index lives in the same `library.db`, in `pdf_fts` / `pdf_status`. It is
-  keyed on `rel_path`, so a catalog rebuild does not invalidate the entries —
-  and `catalog.py` only drops and recreates the *catalog* tables, so a rescan
-  now preserves the index.
+- The index lives in the same `library.db`, in `pdf_pages` / `pdf_fts` /
+  `pdf_status`. Page text is stored once in `pdf_pages`; `pdf_fts` indexes it
+  by integer rowid (external content). Everything is keyed on `rel_path`, so a
+  catalog rebuild does not invalidate the entries — and `catalog.py` only drops
+  and recreates the *catalog* tables, so a rescan now preserves the index.
   > **History:** `catalog.py` used to `os.remove()` the whole database file
   > before rebuilding. That silently destroyed the PDF content index. Fixed.
   > The app also refuses to run a rescan while indexing is in progress.
@@ -590,9 +620,9 @@ small byte-identical files (VTT tokens and minis are typically 300-600 KB). The
 size pre-filter keeps it fast, so there is no reason not to.
 
 `catalog.py` must never delete `library.db`. It drops and recreates only the
-*catalog* tables; `pdf_fts` / `pdf_status` are owned by `index_pdf_text.py` and
-must survive a rescan. Deleting the file used to leave the indexer writing to
-a deleted inode and reporting false success.
+*catalog* tables; `pdf_pages` / `pdf_fts` / `pdf_status` are owned by
+`index_pdf_text.py` and must survive a rescan. Deleting the file used to leave
+the indexer writing to a deleted inode and reporting false success.
 
 Logs and manifests are alongside them. The originals live in
 `/mnt/disk5/archive/roleplaying-games-takeout-20261001T175919Z/`.

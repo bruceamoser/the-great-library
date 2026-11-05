@@ -104,6 +104,8 @@ checkout's local git config already routes pushes through the same helper.
 - Mutating endpoints require the `X-Library-Request: 1` header.
 - Maintenance endpoints are loopback-only unless `RPG_ADMIN_TOKEN` is set.
 - Do not delete `library.db`: `catalog.py` drops and recreates only the catalogue
-  tables, and `pdf_fts` / `pdf_status` must survive a rescan.
+  tables, and `pdf_pages` / `pdf_fts` / `pdf_status` must survive a rescan.
+  `pdf_fts` is external-content over `pdf_pages`; maintain it through the
+  triggers, never by inserting into it directly.
 - Generated caches (`covers/`, `thumbnails/`) are safe to delete and are not
   source.

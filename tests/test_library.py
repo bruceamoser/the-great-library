@@ -29,7 +29,7 @@ class LibraryTests(unittest.TestCase):
     def test_index_rebuild_replaces_existing_pages(self):
         args=(ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db,'--workers','1')
         self.command(*args);self.command(*args,'--rebuild')
-        self.assertEqual(self.query('select count(*) from pdf_fts'),[(1,)])
+        self.assertEqual(self.query('select count(*) from pdf_pages'),[(1,)])
         import pymupdf
         doc=pymupdf.open();p=doc.new_page();p.insert_text((70,70),'replacement gryphon text');doc.save(self.folder/'Corebook.pdf');doc.close()
         self.command(*args,'--rebuild');self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'ancient'"),[(0,)])
@@ -52,7 +52,7 @@ class LibraryTests(unittest.TestCase):
     def test_index_writer_buffers_by_volume_and_loses_only_the_open_batch(self):
         import index_pdf_text
         con=sqlite3.connect(self.db);index_pdf_text.ensure_schema(con)
-        writer=index_pdf_text.IndexWriter(con,1,batch_mb=0.005)
+        writer=index_pdf_text.IndexWriter(con,batch_mb=0.005)
         self.assertFalse(writer.add('a.pdf',1.0,2,3500,[(1,'alpha '*500),(2,'beta text')]))
         self.assertEqual(self.query('select count(*) from pdf_fts'),[(0,)])
         self.assertTrue(writer.add('b.pdf',2.0,1,2500,[(1,'gamma '*400)]))
@@ -61,8 +61,9 @@ class LibraryTests(unittest.TestCase):
         con.close()
         self.assertEqual(self.query('select rel_path from pdf_status order by 1'),[('a.pdf',),('b.pdf',)])
         self.assertEqual(self.query('select count(*) from pdf_fts'),[(3,)])
-        self.assertEqual(self.query('select count(*) from pdf_page_map where fts_rowid not in (select rowid from pdf_fts)'),[(0,)])
-        con=sqlite3.connect(self.db);writer=index_pdf_text.IndexWriter(con,con.execute('select coalesce(max(rowid),0)+1 from pdf_fts').fetchone()[0])
+        self.assertEqual(self.query('select count(*) from pdf_pages'),[(3,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts where rowid not in (select id from pdf_pages)'),[(0,)])
+        con=sqlite3.connect(self.db);writer=index_pdf_text.IndexWriter(con)
         writer.add('a.pdf',9.0,1,2500,[(1,'epsilon '*350)]);writer.flush();con.close()
         self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'alpha'"),[(0,)])
         self.assertEqual(self.query("select count(*) from pdf_fts where pdf_fts match 'epsilon'"),[(1,)])
@@ -105,10 +106,10 @@ class LibraryTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode,0,'the kill landed after the run finished')
         self.assertEqual(self.query('pragma journal_mode'),[('wal',)])
         self.assertEqual(self.query('pragma integrity_check'),[('ok',)])
-        self.assertEqual(self.query('select count(*) from pdf_fts'),self.query('select count(*) from pdf_page_map'))
-        self.assertEqual(self.query('select count(*) from pdf_page_map where fts_rowid not in (select rowid from pdf_fts)'),[(0,)])
-        self.assertEqual(self.query('select count(*) from pdf_fts where rowid not in (select fts_rowid from pdf_page_map)'),[(0,)])
-        self.assertEqual(self.query('select count(*) from (select rel_path,page from pdf_fts group by rel_path,page having count(*)>1)'),[(0,)])
+        self.assertEqual(self.query('select count(*) from pdf_fts'),self.query('select count(*) from pdf_pages'))
+        self.assertEqual(self.query('select count(*) from pdf_fts where rowid not in (select id from pdf_pages)'),[(0,)])
+        self.assertEqual(self.query('select count(*) from pdf_pages where id not in (select rowid from pdf_fts)'),[(0,)])
+        self.assertEqual(self.query('select count(*) from (select rel_path,page from pdf_pages group by rel_path,page having count(*)>1)'),[(0,)])
         for rel_path,mtime,pages,chars,_ in self.query('select rel_path,mtime,pages,chars,indexed_at from pdf_status'):
             self.assertEqual((pages,chars==0),(1,False),rel_path)
         self.command(*self.index_args())
@@ -174,6 +175,16 @@ class LibraryTests(unittest.TestCase):
         r=c.get('/search?q=dragon&cat=book&section=files');self.assertEqual(r.status_code,200);self.assertIn('dragon-notes.txt</a>',r.text)
         self.assertEqual(c.get('/search?q=AND&section=content').status_code,200)
         self.assertEqual(c.get('/search?page=-5').status_code,200)
+    def test_content_search_reads_external_content_index(self):
+        self.command(ROOT/'index_pdf_text.py','--library',self.library,'--db',self.db,'--workers','1')
+        c=self.client();r=c.get('/search?q=dragon&section=content')
+        self.assertEqual(r.status_code,200,r.text)
+        self.assertIn('Inside documents',r.text)
+        self.assertIn('Corebook.pdf',r.text)
+        self.assertIn('<mark>dragon</mark>',r.text)
+        # The content total joins pages back to files, so category filters apply.
+        self.assertIn('Inside documents',c.get('/search?q=dragon&section=content&cat=book').text)
+        self.assertNotIn('Corebook.pdf',c.get('/search?q=dragon&section=content&cat=asset').text)
     def test_slow_request_log_is_one_line_and_switchable(self):
         import app
         c=self.client()
