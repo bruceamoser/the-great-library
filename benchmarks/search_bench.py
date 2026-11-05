@@ -30,14 +30,16 @@ Only the rendered section computes a total (#3): the other three tabs carry no
 count, so a request no longer pays for a query it does not display.
 
 Each section is timed twice.  The `cold` column empties `/search`'s totals cache
-first, so it pays whatever query the section genuinely needs -- on the live host
-the content count.  The remaining columns are repeats inside the cache TTL, the
-cheap case a reader sees when they page through results; a run that measured only
-those would report the cache rather than the query.  "Cold" means the totals
-cache only: the untimed request before it has already read the pages, so the
-operating system's cache is warm and a spinning disk looks better here than the
-first request after a restart does.  A streamed response is not measured --
-`/search` returns HTML, not a stream.
+before each sample -- three samples, reported as the fastest -- so it pays
+whatever query the section genuinely needs: on the live host the content count.
+The remaining columns are repeats inside the cache TTL, the cheap case a reader
+sees when they page through results; a run that measured only those would report
+the cache rather than the query.  `campaigns` is the exception, because it
+rebuilds its catalogue on every request and is not behind the totals cache.
+"Cold" means the totals cache only: the untimed request before it has already
+read the pages, so the operating system's cache is warm and a spinning disk looks
+better here than the first request after a restart does.  A streamed response is
+not measured -- `/search` returns HTML, not a stream.
 
 `--json` prints one JSON object instead of the table, for a regression check.
 """
@@ -58,6 +60,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 SECTIONS = ('collections', 'files', 'content', 'campaigns')
+# Cold samples per section. Each one pays the section's count -- 16 s for the
+# live content total -- so this is the dial that trades run time for a stable
+# number; three is enough for a minimum that does not move between runs.
+COLD_RUNS = 3
 # The live catalogue holds 25,227 files in 763 collections: ~33 per collection.
 FILES_PER_COLLECTION = 33
 # One indexed page in this many carries the query word, so that a content
@@ -270,12 +276,22 @@ def percentile(values, fraction):
 
 
 def measure(db_path, query, sections, runs, warmup):
-    """Time `/search` per section: one cache-miss request, then `runs` repeats.
+    """Time `/search` per section: cold cache-miss requests, then `runs` repeats.
 
-    Returns ``{section: {'cold': ms, 'samples': [ms, ...]}}``.  `/search` caches
-    a section's total for ``app.SEARCH_TOTAL_TTL`` seconds (#3), so the repeat
-    timings alone would never include a count: the cache is emptied before the
-    cold request, which then pays the total that primes the repeats.
+    Returns ``{section: {'cold': ms, 'cold_samples': [ms, ...],
+    'samples': [ms, ...]}}``.  `/search` caches a section's total for
+    ``app.SEARCH_TOTAL_TTL`` seconds (#3), so the repeat timings alone would
+    never include a count: the cache is emptied before each cold request, which
+    then pays the total that primes the repeats.
+
+    `cold` is the fastest of ``COLD_RUNS`` cold samples, not a single one.
+    Timing noise only ever adds time, so the minimum is the usual estimator for
+    what a request genuinely costs; a lone sample sat beside the percentiles and
+    moved by several percent between runs of the same catalogue.
+
+    `campaigns` is the exception: it rebuilds ``campaigns.catalog`` on every
+    request and is not behind the totals cache, so there `cold` is only the
+    fastest of three samples of the same work rather than a cache effect.
     """
     import app
     from fastapi.testclient import TestClient
@@ -303,15 +319,20 @@ def measure(db_path, query, sections, runs, warmup):
                 params['q'] = query
             # One untimed request: module import, template compilation and the
             # first connection are paid once, so `cold` measures the section's
-            # query rather than the process starting.  The cache is emptied
-            # afterwards.
+            # query rather than the process starting.
             search(client, params, section)
-            app.clear_search_totals()
-            cold = timed(client, params, section)
+            # Empty the cache before each cold sample, so every one of them
+            # pays the total instead of reading the previous sample's work.
+            cold_samples = []
+            for _ in range(COLD_RUNS):
+                app.clear_search_totals()
+                cold_samples.append(timed(client, params, section))
             for _ in range(warmup):
                 search(client, params, section)
             samples = [timed(client, params, section) for _ in range(runs)]
-            results[section] = {'cold': cold, 'samples': samples}
+            results[section] = {'cold': min(cold_samples),
+                                'cold_samples': cold_samples,
+                                'samples': samples}
     finally:
         client.close()
         # Leave the module as we found it: `measure` is called in-process by the
@@ -339,7 +360,8 @@ def main(argv=None):
     parser.add_argument('--runs', type=int, default=5,
                         help='timed requests per section (default 5)')
     parser.add_argument('--warmup', type=int, default=1,
-                        help='untimed requests per section first (default 1)')
+                        help='untimed requests per section after the cold '
+                             'samples (default 1)')
     parser.add_argument('--db', default='',
                         help='write the synthetic catalogue here instead of a '
                              'temp dir; the path must not exist yet')
@@ -389,6 +411,7 @@ def main(argv=None):
             shutil.rmtree(tempdir, ignore_errors=True)
 
     stats = {section: {'cold': result['cold'],
+                       'cold_samples': result['cold_samples'],
                        'p50': percentile(result['samples'], 0.50),
                        'p95': percentile(result['samples'], 0.95),
                        'min': min(result['samples']),
@@ -422,10 +445,11 @@ def main(argv=None):
         print(f"{section:<12}{s['cold']:>10.1f}{s['p50']:>10.1f}{s['p95']:>10.1f}"
               f"{s['min']:>10.1f}{s['max']:>10.1f}")
     print()
-    print('Timings are full in-process /search requests. "cold" empties the '
-          'totals cache first, so\nit pays the query the section needs; only '
-          'the rendered section computes a total, and\nthe other columns are '
-          'repeats inside the 60 s cache TTL.')
+    print('Timings are full in-process /search requests. "cold" is the fastest '
+          'of three\nrequests with the totals cache emptied, so it pays the '
+          'query the section needs.\nOnly the rendered section computes a '
+          'total; the other columns are repeats inside\nthe 60 s cache that '
+          'holds it, except campaigns, which is rebuilt on every request.')
     return 0
 
 

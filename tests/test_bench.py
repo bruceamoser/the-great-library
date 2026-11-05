@@ -24,6 +24,8 @@ class SearchBenchTests(unittest.TestCase):
         for stats in data['sections'].values():
             self.assertEqual(len(stats['samples']),2);self.assertGreater(stats['p50'],0)
             self.assertGreater(stats['cold'],0)
+            self.assertEqual(len(stats['cold_samples']),3)
+            self.assertEqual(stats['cold'],min(stats['cold_samples']))
     def test_files_index_is_populated_so_search_takes_the_fts_path(self):
         # An empty files_fts is not an error: /search finds no rows, returns
         # fast, and the benchmark reports a good number for the wrong query.
@@ -88,14 +90,22 @@ class SearchBenchTests(unittest.TestCase):
             finally:
                 app.clear_search_totals = original_clear
                 app.search_total = original_total
-            self.assertEqual(len(clears), 2)
-            # One total per request: prime, cold, then the two repeats. The cold
-            # request must miss -- that is the whole point of clearing first --
-            # and the repeats must hit, or the sample is not the cached case.
-            self.assertEqual(misses, [True, True, False, False] * 2)
+            self.assertEqual(len(clears), 2 * bench.COLD_RUNS)
+            # One total per request: the untimed prime, then one per cold
+            # sample. Every cold request must miss -- clearing before each of
+            # them is the whole point -- and the repeats must hit, or the
+            # sample is not the cached case.
+            per_section = ([True] * (1 + bench.COLD_RUNS)
+                           + [False] * 2)
+            self.assertEqual(misses, per_section * 2)
             for section in ('collections', 'content'):
-                self.assertGreater(results[section]['cold'], 0)
-                self.assertEqual(len(results[section]['samples']), 2)
+                result = results[section]
+                self.assertGreater(result['cold'], 0)
+                self.assertEqual(len(result['cold_samples']), bench.COLD_RUNS)
+                # `cold` is the fastest of the samples: timing noise only ever
+                # adds time, so min is the estimator for the request's cost.
+                self.assertEqual(result['cold'], min(result['cold_samples']))
+                self.assertEqual(len(result['samples']), 2)
     def test_measure_restores_the_module_database(self):
         # `measure` swaps app.DB for the synthetic catalogue; the tests call it
         # in-process, so leaving it pointing into a deleted temp dir would leak
