@@ -21,8 +21,9 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
       # Named separately so a search regression is obvious in the checks list.
-      # The rules that depend on #3 and #4 are skipped while those issues are
-      # open; set RPG_PERF_STRICT: "1" here (or delete their entries in
-      # tests/test_performance.py) once they land.
+      # Every rule is enforced now that #3 and #4 have landed; RPG_PERF_STRICT
+      # keeps it that way if a rule is ever parked as pending again.
       - name: Search performance regression checks
+        env:
+          RPG_PERF_STRICT: "1"
         run: python -m unittest discover -s tests -p 'test_performance.py' -v
