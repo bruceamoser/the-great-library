@@ -1066,7 +1066,7 @@ def _run_index(rebuild: bool, workers: int = 3) -> None:
     rc = -1
     try:
         # Keep the indexer from starving the web app: the library is on a
-        # single spinning disk, so heavy parallel reads block everything else.
+        # single spinning disk, so give the indexing reads low I/O priority.
         import shutil
         launcher = []
         if shutil.which('ionice'):
