@@ -33,7 +33,9 @@ CI runs the same command on every push and pull request.
 catalogue, records every statement `/search` executes and the plan SQLite picks,
 and fails when a full scan or an eagerly paid count comes back. Every rule is
 enforced, so a reintroduced scan fails the suite; there is no skip list.
-`RPG_PERF_LATENCY_MS` overrides the 250 ms per-section budget.
+`RPG_PERF_LATENCY_MS` overrides the 250 ms per-section budget, which is measured
+cold: the totals cache is emptied before each sample, so the figure covers the
+query the section needs rather than a cache hit.
 
 ## Measuring search
 
