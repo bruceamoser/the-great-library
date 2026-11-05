@@ -105,6 +105,36 @@ Environment overrides:
 | `RPG_DB` | `./library.db` |
 | `PORT` | `8765` |
 
+### Database connection settings
+
+The catalogue is 3.66 GB and SQLite's defaults are tuned for a small file: a
+2 MB page cache, no memory map, temp tables on disk. Every connection
+therefore sets its own pragmas, in `sqlite_settings()` in `app.py`:
+
+| Pragma | Default | Meaning | Environment |
+|---|---|---|---|
+| `cache_size` | `-65536` | 64 MB page cache (negative values are KiB, not pages) | `RPG_SQLITE_CACHE_MB` (64) |
+| `mmap_size` | `268435456` | map up to 256 MB of the file into memory, 0 disables it | `RPG_SQLITE_MMAP_MB` (256) |
+| `temp_store` | `MEMORY` | sort and temp tables in RAM, not in `/tmp` | `RPG_SQLITE_TEMP_STORE` (`MEMORY`, `FILE` or `DEFAULT`) |
+| `busy_timeout` | `5000` | milliseconds to wait for a lock before failing | `RPG_SQLITE_BUSY_TIMEOUT_MS` (5000) |
+
+Unparseable values fall back to the default, and `temp_store` only accepts the
+three keywords above, so a typo in the unit file cannot inject SQL or leave the
+app without a working cache. Writes are serialised by the maintenance lease
+anyway, which is why the default busy timeout is shorter than the old 30 s.
+
+The page cache is per connection, and a request holds one connection at a time,
+so the ceiling on a busy LAN is roughly *cache size × concurrent requests* —
+lower `RPG_SQLITE_CACHE_MB` if the host ever runs short of memory. The mmap is
+shared by the OS page cache rather than copied per connection.
+
+Reads run on a **read-only** connection (`file:…?mode=ro`). Only the two routes
+that change the catalogue — `POST /api/metadata/{cid}` and
+`POST /api/book-metadata/{fid}` — open a writable handle with `db(write=True)`;
+a write attempted on a read connection fails with `attempt to write a readonly
+database` rather than silently succeeding. `GET /classification` creates its
+audit table through a writable handle only if an old catalogue is missing it.
+
 ### Reaching it from another device on the LAN
 
 The server already listens on `0.0.0.0:8765`, so no code change is needed —
@@ -356,6 +386,33 @@ well and depends on nothing.
 The default search indexes collection names, shelves, tags and **filenames**.
 A separate opt-in index adds the **text inside** every PDF, so a search for
 `grappling` returns matching *pages*, not just files whose names contain it.
+
+### Search architecture
+
+Search is **SQLite FTS5 inside the same `library.db` as the catalogue** — there
+is no search server. Why that is the right engine here, what would change it,
+and what it costs are recorded in
+[docs/adr/0001-search-architecture.md](docs/adr/0001-search-architecture.md).
+
+Current live catalogue, measured on 2026-11-04: **763 collections**, **25,227
+files**, **309,790 indexed pages**, `library.db` **3.66 GB**. (Older figures
+elsewhere in this README describe the October restructure as it stood then.)
+
+| Query on the live catalogue | HDD (live host) | NVMe (copy) |
+|---|---|---|
+| content total — `COUNT(*)` over `pdf_fts MATCH`, 26,634 hits | 16,006 ms | **70 ms** |
+| content page — 36 results | 439 ms | — |
+| files `filename LIKE '%…%'` count | 2,779 ms | — |
+| collections `LIKE` count | 72 ms | — |
+
+The 16 s figure is **random reads of unindexed FTS columns on a spinning disk,
+not a limit of SQLite** — the identical database answers the identical count in
+70 ms on NVMe. Note also that the slow part is the *total*, not the page: the 36
+rows a reader actually sees cost 439 ms. Hence the current work: keep
+`library.db` on NVMe with the media on the HDD, compute totals only for the
+active section (#3), search filenames and classification through FTS instead of
+`LIKE` scans (#4), tune the connection pragmas (#5), and rebuild the PDF index
+with integer keys and external content (#6).
 
 ### Build it
 
@@ -848,3 +905,7 @@ alone are a poor signal, and the server says so explicitly in
 See [RELEASE-NOTES.md](RELEASE-NOTES.md) for the redesigned interface, reading desk, classification ledger, persistent annotations, maintenance security, regression tests, and backup/restore instructions. The classification rules are in `taxonomy.py`; manual choices are stored in `metadata_overrides` and survive scans.
 
 See [FOLLOWUP-NOTES.md](FOLLOWUP-NOTES.md) for the October 7 search feedback, search-return navigation, TIFF previews, and per-file classification hierarchy.
+
+Architecture decisions live in [`docs/adr/`](docs/adr/):
+
+- [0001 — Search stays on SQLite FTS5](docs/adr/0001-search-architecture.md)

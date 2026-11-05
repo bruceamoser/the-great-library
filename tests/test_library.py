@@ -240,6 +240,54 @@ class LibraryTests(unittest.TestCase):
         from backup import backup
         target=backup(self.db,self.root/'backup.db')
         with sqlite3.connect(target) as c:self.assertEqual(c.execute('pragma integrity_check').fetchone()[0],'ok')
+    def test_read_connections_refuse_to_write(self):
+        import app
+        app.DB=str(self.db)
+        con=app.db()
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as caught:con.execute("UPDATE files SET filename='x'")
+            self.assertIn('readonly',str(caught.exception))
+        finally:con.close()
+        writable=app.db(write=True)
+        try:writable.execute("UPDATE files SET filename=filename");writable.rollback()
+        finally:writable.close()
+    def test_read_routes_open_read_only_connections(self):
+        import app
+        from fastapi.testclient import TestClient
+        app.DB=str(self.db);app.LIBRARY=str(self.library)
+        client=TestClient(app.app);cid=self.query('SELECT id FROM collections')[0][0]
+        real=app._connect;opened=[]
+        def spy(path,write):
+            opened.append(write);return real(path,write)
+        with patch.object(app,'_connect',side_effect=spy):
+            for path in ('/','/browse','/search?q=dragon','/api/stats','/classification','/explore','/campaigns',f'/collection/{cid}'):
+                with self.subTest(path=path):self.assertEqual(client.get(path).status_code,200)
+        self.assertTrue(opened);self.assertFalse(any(opened),'a GET opened a writable connection')
+    def test_every_connection_gets_tuned_pragmas(self):
+        import app
+        app.DB=str(self.db)
+        for write in (False,True):
+            con=app.db(write=write)
+            try:pragmas={name:con.execute('PRAGMA '+name).fetchone()[0] for name in ('cache_size','mmap_size','temp_store','busy_timeout')}
+            finally:con.close()
+            with self.subTest(write=write):
+                self.assertEqual(pragmas,{'cache_size':-65536,'mmap_size':268435456,'temp_store':2,'busy_timeout':5000})
+    def test_pragmas_are_configurable_and_validated(self):
+        import app
+        app.DB=str(self.db)
+        with patch.dict(os.environ,{'RPG_SQLITE_CACHE_MB':'12','RPG_SQLITE_MMAP_MB':'0','RPG_SQLITE_TEMP_STORE':'file','RPG_SQLITE_BUSY_TIMEOUT_MS':'250'}):
+            con=app.db()
+            try:pragmas={name:con.execute('PRAGMA '+name).fetchone()[0] for name in ('cache_size','mmap_size','temp_store','busy_timeout')}
+            finally:con.close()
+            self.assertEqual(pragmas,{'cache_size':-12288,'mmap_size':0,'temp_store':1,'busy_timeout':250})
+        # nonsense falls back to the defaults instead of reaching SQL
+        with patch.dict(os.environ,{'RPG_SQLITE_CACHE_MB':'lots','RPG_SQLITE_TEMP_STORE':'MEMORY; DROP TABLE files'}):
+            con=app.db()
+            try:
+                self.assertEqual(con.execute('PRAGMA cache_size').fetchone()[0],-65536)
+                self.assertEqual(con.execute('PRAGMA temp_store').fetchone()[0],2)
+                self.assertEqual(con.execute('SELECT COUNT(*) FROM files').fetchone()[0],2)
+            finally:con.close()
     def test_sync_stops_and_reports_failed_stage(self):
         import app,jobs
         from types import SimpleNamespace
