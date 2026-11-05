@@ -16,9 +16,11 @@ The rules
 3. ``no_files_scan`` - no plan step that scans ``files`` end to end, for the
    sections that have an index path.  ``section=files`` is exempt: it pages
    through matching files, so it walks the table by design.
-4. Latency - each section answers well inside a generous budget on the
-   synthetic set.  This is a backstop against collapse, not a benchmark: the
-   structural rules above are exact and deterministic.
+4. Latency - each cold section answers well inside a generous budget on the
+   synthetic set.  The totals cache is emptied before each sample, so the
+   figure covers the query the section genuinely needs rather than a cache
+   hit.  This is a backstop against collapse, not a benchmark: the structural
+   rules above are exact and deterministic.
 
 Every rule is enforced: there is no skip list, so a reintroduced full scan or an
 eagerly paid count always fails the suite rather than being parked on an issue.
@@ -372,11 +374,24 @@ class SearchPerformanceTests(unittest.TestCase):
     # -- 4. latency backstop ----------------------------------------------
 
     def test_sections_answer_within_the_latency_budget(self):
+        """Time a *cold* section, so the sample pays whatever query it needs.
+
+        The totals cache makes every repeat after the first a hit: test_fixture_*
+        has already requested each URL, so an untimed measurement would report
+        the cache rather than the query and a content count that had grown from
+        70 ms to 16 s would still pass here (#20 fixed the same mistake in
+        benchmarks/search_bench.py).  Emptying the cache before each sample is
+        what makes this a backstop against the expensive case.
+        """
+        paid_content_count = False
         for name, url in URLS.items():
             times = []
             for _ in range(TIMING_REPEATS):
-                response, elapsed, _statements = self.run_request(url)
+                self.app.clear_search_totals()
+                response, elapsed, statements = self.run_request(url)
                 self.assertEqual(response.status_code, 200, url)
+                if name == 'content' and any(map(content_count, statements)):
+                    paid_content_count = True
                 times.append(elapsed)
             best = min(times)
             self.assertLess(
@@ -384,6 +399,12 @@ class SearchPerformanceTests(unittest.TestCase):
                 f'{url} took {best:.0f} ms (best of {TIMING_REPEATS}, '
                 f'{", ".join(f"{t:.0f}" for t in times)}); budget is '
                 f'{LATENCY_BUDGET_MS:.0f} ms - a full scan or an eager count is back')
+        # Guard the guard: if the samples ever go back to hitting the cache,
+        # this fails instead of the budget passing on work that never ran.
+        self.assertTrue(
+            paid_content_count,
+            'the content sample never executed its COUNT(*) over pdf_fts: the '
+            'totals cache was warm, so this timed the cache, not the query')
 
     # -- 5. the fixture measures something ---------------------------------
 
