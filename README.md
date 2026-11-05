@@ -105,6 +105,36 @@ Environment overrides:
 | `RPG_DB` | `./library.db` |
 | `PORT` | `8765` |
 
+### Database connection settings
+
+The catalogue is 3.66 GB and SQLite's defaults are tuned for a small file: a
+2 MB page cache, no memory map, temp tables on disk. Every connection
+therefore sets its own pragmas, in `sqlite_settings()` in `app.py`:
+
+| Pragma | Default | Meaning | Environment |
+|---|---|---|---|
+| `cache_size` | `-65536` | 64 MB page cache (negative values are KiB, not pages) | `RPG_SQLITE_CACHE_MB` (64) |
+| `mmap_size` | `268435456` | map up to 256 MB of the file into memory, 0 disables it | `RPG_SQLITE_MMAP_MB` (256) |
+| `temp_store` | `MEMORY` | sort and temp tables in RAM, not in `/tmp` | `RPG_SQLITE_TEMP_STORE` (`MEMORY`, `FILE` or `DEFAULT`) |
+| `busy_timeout` | `5000` | milliseconds to wait for a lock before failing | `RPG_SQLITE_BUSY_TIMEOUT_MS` (5000) |
+
+Unparseable values fall back to the default, and `temp_store` only accepts the
+three keywords above, so a typo in the unit file cannot inject SQL or leave the
+app without a working cache. Writes are serialised by the maintenance lease
+anyway, which is why the default busy timeout is shorter than the old 30 s.
+
+The page cache is per connection, and a request holds one connection at a time,
+so the ceiling on a busy LAN is roughly *cache size × concurrent requests* —
+lower `RPG_SQLITE_CACHE_MB` if the host ever runs short of memory. The mmap is
+shared by the OS page cache rather than copied per connection.
+
+Reads run on a **read-only** connection (`file:…?mode=ro`). Only the two routes
+that change the catalogue — `POST /api/metadata/{cid}` and
+`POST /api/book-metadata/{fid}` — open a writable handle with `db(write=True)`;
+a write attempted on a read connection fails with `attempt to write a readonly
+database` rather than silently succeeding. `GET /classification` creates its
+audit table through a writable handle only if an old catalogue is missing it.
+
 ### Reaching it from another device on the LAN
 
 The server already listens on `0.0.0.0:8765`, so no code change is needed —
@@ -357,6 +387,33 @@ The default search indexes collection names, shelves, tags and **filenames**.
 A separate opt-in index adds the **text inside** every PDF, so a search for
 `grappling` returns matching *pages*, not just files whose names contain it.
 
+### Search architecture
+
+Search is **SQLite FTS5 inside the same `library.db` as the catalogue** — there
+is no search server. Why that is the right engine here, what would change it,
+and what it costs are recorded in
+[docs/adr/0001-search-architecture.md](docs/adr/0001-search-architecture.md).
+
+Current live catalogue, measured on 2026-11-04: **763 collections**, **25,227
+files**, **309,790 indexed pages**, `library.db` **3.66 GB**. (Older figures
+elsewhere in this README describe the October restructure as it stood then.)
+
+| Query on the live catalogue | HDD (live host) | NVMe (copy) |
+|---|---|---|
+| content total — `COUNT(*)` over `pdf_fts MATCH`, 26,634 hits | 16,006 ms | **70 ms** |
+| content page — 36 results | 439 ms | — |
+| files `filename LIKE '%…%'` count | 2,779 ms | — |
+| collections `LIKE` count | 72 ms | — |
+
+The 16 s figure is **random reads of unindexed FTS columns on a spinning disk,
+not a limit of SQLite** — the identical database answers the identical count in
+70 ms on NVMe. Note also that the slow part is the *total*, not the page: the 36
+rows a reader actually sees cost 439 ms. Hence the current work: keep
+`library.db` on NVMe with the media on the HDD, compute totals only for the
+active section (#3), search filenames and classification through FTS instead of
+`LIKE` scans (#4), tune the connection pragmas (#5), and rebuild the PDF index
+with integer keys and external content (#6).
+
 ### Build it
 
 From the app: **Sync & Index** → *Build / update index*.
@@ -382,8 +439,11 @@ Measured on this machine, full rebuild of the restructured library
 | Hard failures | **2** — both pre-existing zero-byte PDFs in the source export |
 | Stale rows pruned | 4,896 (correctly removed after the restructure renamed every path) |
 
-A full rebuild takes an hour-plus because every PDF must be re-extracted; an
-incremental run only touches files whose mtime changed.
+That run used the old code, which let MuPDF read each PDF in its own scattered
+order. Reading each file as one sequential stream and parsing it from memory is
+~3.9–5.3× faster at the same worker count, so the same rebuild should take
+**~16–20 min** rather than 72. See *Why three workers, and why streamed reads*
+below.
 
 ### Upgrade an existing index
 
@@ -414,22 +474,88 @@ to the final database size (~2 GB). Run it at a quiet moment: if SQLite reports
 the database is locked during `VACUUM`, re-run the same command — the schema
 upgrade is already committed and is skipped, and only the VACUUM is retried.
 
-### Why only 3 workers, and why `ionice`
+A full rebuild takes tens of minutes because every PDF must be re-extracted;
+an incremental run only touches files whose mtime changed.
+
+### Where the 72 minutes actually went
+
+The index is written to `library.db`, which lives on the NVMe system disk,
+while the PDFs live on the spinning data disk — so reads and writes do not
+compete. Measured cost of each part, for an index the size of the real one
+(309,790 pages, 1.25 GB of text):
+
+| Stage | Cost | Share of a 72-min run |
+|---|---|---|
+| Reading and extracting the PDFs (3 workers) | ~69 min | **~96%** |
+| Writing every page into `pdf_pages` | ~35 s | 0.8% |
+| Trailing `INSERT INTO pdf_fts(pdf_fts) VALUES('optimize')` | ~5 s | 0.1% |
+| Pruning stale rows | ~0.4 s | — |
+
+So batching and durability pragmas were never the lever — they are worth under
+a minute in total. The PDF reads are, and the thing that was wrong with them
+was not the worker count but the **read pattern**: MuPDF walks each file's
+object graph, so its reads arrive scattered across the file, which on one
+spinning disk is a stream of seeks.
+
+Writes are nevertheless batched by volume (about 12 MB of page text, or 200
+files, per transaction — `--batch-mb` tunes it), and **during a rebuild only**
+the connection runs with a 64 MB cache and `synchronous=NORMAL`. Both are
+per-connection settings that disappear when the indexer exits, so an
+interruption loses at most the batch in flight and the next run resumes from
+the last commit, since finished files are already recorded in `pdf_status`.
+`NORMAL` in WAL mode cannot corrupt the database — it can only lose the last
+commits to a power cut, which the next run redoes — and it costs ~2 s less
+than the default across a whole rebuild.
+
+`journal_mode` is deliberately left alone: it is stored in the database file,
+so a rebuild killed while it was in `MEMORY` would leave the live catalogue
+crash-unsafe for the web app. Incremental runs never change any of this.
+
+### Why three workers, and why streamed reads
 
 The library sits on a **single spinning disk** (WD Caviar Black, 120 MB/s
-sequential). Parallel PDF reads are effectively random access, so many workers
-cause seek thrashing rather than speedup.
+sequential). MuPDF reads a PDF object by object, in an order that is not
+sequential on disk, so on a spinning disk each of those small reads can cost a
+seek. `index_pdf_text.py` therefore reads each whole file in one sequential
+pass and hands the bytes to MuPDF (`open_pdf()`); files larger than
+`--stream-max-mb` (default 256 MB, above the library's 99th percentile) are
+opened in place so worker memory stays bounded.
 
-This is not theoretical: at 8 workers the web app was observed stuck in
-uninterruptible disk sleep (`State: D`, `wchan: read_extent_buffer_pages`),
-unable to serve a single request, purely because the indexer had saturated the
-disk queue.
+Where the time goes depends on both the read pattern *and* the worker count,
+because they interact — scattered reads get worse with parallelism, sequential
+reads get better until the disk saturates. Measured on the real library, cold,
+with the page cache dropped before every read — 60 random files, 881 MB, 4,022
+pages, and identical text extracted in every row:
+
+| Workers | Read pattern | Time | Throughput |
+|---|---|---|---|
+| 3 | scattered | 57.4 s | 69 pages/s |
+| 1 | streamed | 31.4 s | 128 pages/s |
+| 2 | streamed | 16.9 s | 238 pages/s |
+| **3** | **streamed** | **14.9 s** | **271 pages/s** |
+| 4 | streamed | 15.1 s | 266 pages/s |
+
+A second, wider sample (80 files, 6,001 pages) agreed: 3 workers streamed
+reached 328 pages/s against 62 pages/s for the old pattern, ~5.3×, and 4 and 6
+workers were again slower than 3. So the default is 3 workers *with* streaming,
+~3.9× the old code on the narrower sample and better on the wider one.
+
+That also disposes of the old story about this machine: the 72-minute run at
+3 workers was not slow because three workers were too many, it was slow because
+each of them was issuing scattered reads. `--workers 1` without streaming is
+only ~1.8× better, which is why the two changes belong together.
+
+Streaming also makes the run *gentler*, not just shorter: a sequential read is
+one seek for megabytes, and finishing in a fifth of the time leaves the disk
+idle for far longer. It is still not free, though — at 8 workers the web app
+was observed stuck in uninterruptible disk sleep (`State: D`,
+`wchan: read_extent_buffer_pages`), unable to serve a single request, purely
+because the indexer had saturated the disk queue. Do not add workers past the
+measured optimum.
 
 The app therefore launches the indexer as
 `ionice -c2 -n7 nice -n 19 ... --workers 3`: best-effort I/O at the lowest
 priority, so heavy reads yield to interactive traffic but still get scheduled.
-Indexing takes longer than an unconstrained run but the library stays
-responsive throughout.
 
 > **Do not use `ionice -c3` (idle class) here.** On the `mq-deadline`
 scheduler idle-class requests are only dispatched when the disk queue is
@@ -539,6 +665,8 @@ rpg-app/
   covers/                on-demand shelf cover cache
   thumbnails.py          pre-generates the thumbnail cache (see below)
   mcp_server.py          MCP server for AI assistants (see section 11)
+  benchmarks/search_bench.py   offline /search benchmark (see below)
+  tests/                 unittest suite; needs no library data
   .venv/                 Python 3.14 virtualenv
 ```
 
@@ -603,7 +731,7 @@ safe to delete at any time.
 | `GET /api/dtrpg/status` | sync job state + log tail |
 | `POST /api/dtrpg/sync?dry_run=0&dedupe=1&merge=1&rescan=1` | start DriveThruRPG sync |
 | `GET /api/index/status` | PDF index progress |
-| `POST /api/index/build?rebuild=0&workers=3` | start PDF text indexing |
+| `POST /api/index/build?rebuild=0&workers=3` | start PDF text indexing (three workers, each streaming a whole file: fastest measured on the library disk) |
 | `POST /api/rescan` | rebuild the catalog |
 | `GET /thumb/{fid}?w=320\|1600` | cached downscaled image (see file lists) |
 | `GET /cover/{cid}` | cached shelf cover for a collection |
@@ -613,6 +741,81 @@ Mutating endpoints return **409** if the conflicting job is already running:
 sync refuses while indexing, and rescan/index refuse while the other runs.
 "Already running" covers indexers started from the shell — the app scans `/proc`
 for `index_pdf_text.py` rather than relying only on its own job registry.
+
+### Measuring search performance
+
+`/search` is the slowest surface in the app, and on the live catalogue its
+slowest query is the **total**, not the page of results: on 2026-11-04, on the
+host's spinning disk, a content count over 309,790 indexed pages took 16,006 ms
+where the same count on NVMe took 70 ms. Three tools make that measurable instead
+of guesswork: a regression gate in the test suite, a benchmark you run by hand,
+and a line the server writes in production.
+
+`tests/test_performance.py` is the gate: it records every statement `/search`
+executes and the plan SQLite picks, and fails when a full scan or an eagerly paid
+count comes back. It runs in CI and answers "did this change make a query scan?",
+not "how long does a section take".
+
+**`benchmarks/search_bench.py`** answers the second question. It builds a
+synthetic catalogue using the real schemas (`catalog.SCHEMA`,
+`index_pdf_text.SCHEMA`, and the tables `classification`/`taxonomy`/`metadata`
+create) in a throwaway SQLite file, then drives the actual `/search` route
+through FastAPI's in-process test client, once per section. The search indexes
+are filled through the same functions a rescan calls
+(`catalog.rebuild_files_fts`, `index_pdf_text.ensure_schema`), so the timings
+cover the FTS query paths rather than their empty-index fallbacks. No library
+data, no server started, no network.
+
+```sh
+.venv/bin/python benchmarks/search_bench.py                        # 5,000 files / 50,000 pages
+.venv/bin/python benchmarks/search_bench.py --files 25227 --pages 309790 --collections 763
+.venv/bin/python benchmarks/search_bench.py --runs 10 --query ''    # filter mode, no query
+```
+
+```
+synthetic catalogue  5,000 files  50,000 pages  152 collections  (5,000 in files_fts, built in 0.6 s)
+query                'dragon'   5 run(s), 1 warm-up
+db                   /tmp/rpg-search-bench-hgxy0yok/bench.db (deleted)
+
+section         p50 ms    p95 ms    min ms    max ms
+collections       41.2      41.7      40.5      41.7
+files             41.1      43.4      39.8      43.5
+content           61.1      62.6      57.4      62.9
+campaigns         60.7      65.6      60.4      66.7
+```
+
+Each number is a whole request, template rendering included, because that is
+what the reader waits for. The handler runs its four `totals` queries for every
+section, so a costly count shows up in all four rows; what separates the rows is
+the section's own page query. `--json` prints the same measurements as a single
+object for a regression check. `--db PATH` writes the synthetic catalogue
+somewhere you keep, and refuses a path that already exists so it can never
+overwrite `library.db`. `--runs`/`--warmup` control the sample, `--seed` fixes
+the generated rows, and p50/p95 are the linear-interpolated percentiles.
+
+The timings belong to the machine that produced them and to a synthetic
+catalogue; they are comparable to each other — same `--files`, `--pages` and
+`--query` — not to the numbers in section 9's neighbours or to a live page. Run
+it on the host when the question is about the host's disk.
+
+The default query hits roughly 1 page in 20, which keeps a content search big
+enough to be worth timing; `--query ''` benchmarks filter-only browsing.
+
+**Slow-request log.** Any request slower than `RPG_SLOW_LOG_MS` (default 250,
+`0` disables) writes one line to stderr with method, path, `section` and
+duration:
+
+```
+slow GET /search section=content 16006ms status=200
+```
+
+Nothing needs configuring: the app attaches a handler to the `rpg.slow` logger
+because uvicorn configures only its own. Under systemd (`rpg-library.service`)
+the line lands in `journalctl -u rpg-library`; started by `./manage.sh` it goes
+to `uvicorn.log`, which `./manage.sh logs` tails. Two limits worth knowing: a
+streamed response (a file from `/raw`, a thumbnail) is timed up to its headers
+rather than to its last byte, and the log records the `section` parameter but
+not the search terms themselves.
 
 ---
 
@@ -809,3 +1012,7 @@ alone are a poor signal, and the server says so explicitly in
 See [RELEASE-NOTES.md](RELEASE-NOTES.md) for the redesigned interface, reading desk, classification ledger, persistent annotations, maintenance security, regression tests, and backup/restore instructions. The classification rules are in `taxonomy.py`; manual choices are stored in `metadata_overrides` and survive scans.
 
 See [FOLLOWUP-NOTES.md](FOLLOWUP-NOTES.md) for the October 7 search feedback, search-return navigation, TIFF previews, and per-file classification hierarchy.
+
+Architecture decisions live in [`docs/adr/`](docs/adr/):
+
+- [0001 — Search stays on SQLite FTS5](docs/adr/0001-search-architecture.md)

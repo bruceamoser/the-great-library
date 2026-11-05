@@ -29,6 +29,44 @@ dependency deliberately, not as a side effect.
 The suite needs no catalogue and no library data; it builds temporary databases.
 CI runs the same command on every push and pull request.
 
+`tests/test_performance.py` is the search regression gate. It builds a synthetic
+catalogue, records every statement `/search` executes and the plan SQLite picks,
+and fails when a full scan or an eagerly paid count comes back. Rules that the
+code does not satisfy yet are listed in `PENDING` with the issue that has to
+land first: while such a rule fails the test is skipped with that issue named,
+so set `RPG_PERF_STRICT=1` to enforce them anyway and delete the entry once it
+passes (the test warns when that happens). `RPG_PERF_LATENCY_MS` overrides the
+250 ms per-section budget.
+
+## Measuring search
+
+That gate answers "did this change make a query scan?"; it does not say how long
+a section takes. `benchmarks/search_bench.py` does: it builds a synthetic
+catalogue from the real schemas and times the actual `/search` route per
+section, offline.
+
+```sh
+.venv/bin/python benchmarks/search_bench.py --files 5000 --pages 50000
+```
+
+It refuses to write over an existing file, so `--db` is safe to point at a
+scratch path; without it the catalogue is built in a temp dir and deleted. Judge
+a change against the same size and query as the run before it — the default
+query matches about 1 page in 20, the scale at which a content count hurts.
+
+Any request slower than `RPG_SLOW_LOG_MS` (default 250 ms, `0` turns it off)
+writes one stderr line from the `rpg.slow` logger:
+
+```
+slow GET /search section=content 16006ms status=200
+```
+
+Of the three that is the only one that measures the real thing in production, so
+it is what shows a change helped on the disk that serves the library. On the
+host that disk is spinning: a content total over 309,790 pages takes 16 s there
+and 70 ms on NVMe for the same database. Measure there before believing an
+optimisation helped.
+
 ## Running locally
 
 ```sh

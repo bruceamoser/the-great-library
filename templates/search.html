@@ -38,7 +38,7 @@
   <button type="submit">Search the library</button>
 </form>
 
-<p><a class="quiet-button" href="{{ browse_url(request,'/explore?q=' ~ q|urlencode) }}">Explore systems, editions, series &amp; resources →</a></p><nav class="result-tabs" aria-label="Result type">{% for value,label in [('collections','Collections'),('files','Books & assets'),('content','Inside books'),('campaigns','Campaigns')] %}<a class="{{ 'active' if section==value else '' }}" href="{{ result_url(section=value,page=1) }}">{{ label }} <span>{{ '{:,}'.format(totals[value]) }}</span></a>{% endfor %}</nav>
+<p><a class="quiet-button" href="{{ browse_url(request,'/explore?q=' ~ q|urlencode) }}">Explore systems, editions, series &amp; resources →</a></p><nav class="result-tabs" aria-label="Result type">{% for value,label in [('collections','Collections'),('files','Books & assets'),('content','Inside books'),('campaigns','Campaigns')] %}<a class="{{ 'active' if section==value else '' }}" href="{{ result_url(section=value,page=1) }}">{{ label }}{% if totals.get(value) is not none %} <span>{{ '{:,}'.format(totals[value]) }}</span>{% endif %}</a>{% endfor %}</nav>
 {% if q %}<p class="search-summary">Results for “{{ q }}”</p>{% endif %}
 {% if not index_available %}<p class="warn">Inside-book search is not indexed yet. Build the index in the Keeper’s Office.</p>{% endif %}
 {% if campaigns %}{% include '_campaign_cards.html' %}{% endif %}
