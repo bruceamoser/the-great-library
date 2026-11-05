@@ -183,7 +183,7 @@ def report(results, expected, sample_mib):
         row = {'configuration': label, 'best_s': round(best, 2),
                'median_s': round(median, 2),
                'pages_s': round(pages / median, 1),
-               'mib_s': round(sample_mib / median, 1),
+               'mib_s': round(sample_mib / median, 3),
                'files_s': round(runs[0][1] / median, 2),
                'vs_base': round(baseline / median, 2)}
         rows.append(row)

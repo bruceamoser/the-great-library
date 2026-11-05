@@ -30,8 +30,13 @@ def make_corpus(directory, pages_per_file=PAGES_PER_FILE):
         doc = pymupdf.open()
         for page in range(pages):
             surface = doc.new_page()
-            surface.insert_text(
-                (72, 72), f'book {i} page {page} ' + 'dragon ' * 20)
+            # Enough text that a page is a realistic few kB rather than a few
+            # bytes: the projection divides by MiB/s, which is meaningless on
+            # a corpus this small otherwise.
+            for line in range(40):
+                surface.insert_text(
+                    (72, 72 + line * 12),
+                    f'book {i} page {page} line {line} ' + 'dragon ' * 8)
         doc.save(str(Path(directory) / f'book{i}.pdf'))
         doc.close()
 
