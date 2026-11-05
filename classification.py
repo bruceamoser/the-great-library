@@ -200,5 +200,10 @@ if __name__=='__main__':
      titles[r['rel_path']].append((int(r['page']),r['text']))
     for path,parts in titles.items():con.execute('INSERT OR REPLACE INTO book_title_evidence VALUES (?,0,?)',(path,'\n'.join(t for _,t in sorted(parts))[:3600]))
    except sqlite3.OperationalError:pass
-  print('Classified',enrich(con),'files',flush=True);con.commit();con.close()
+  print('Classified',enrich(con),'files',flush=True)
+  # system/series/campaign feed files_fts, so a standalone classification run
+  # must refresh the file index that /search reads.
+  from catalog import rebuild_files_fts
+  print('Indexed',rebuild_files_fts(con),'files',flush=True)
+  con.commit();con.close()
  run('classification',work)
