@@ -773,25 +773,34 @@ data, no server started, no network.
 ```
 
 ```
-synthetic catalogue  5,000 files  50,000 pages  152 collections  (5,000 in files_fts, built in 0.6 s)
+synthetic catalogue  5,000 files  50,000 pages  152 collections  (5,000 in files_fts, built in 1.7 s)
 query                'dragon'   5 run(s), 1 warm-up
-db                   /tmp/rpg-search-bench-hgxy0yok/bench.db (deleted)
+db                   /tmp/rpg-search-bench-y70x7tpd/bench.db (deleted)
 
-section         p50 ms    p95 ms    min ms    max ms
-collections       41.2      41.7      40.5      41.7
-files             41.1      43.4      39.8      43.5
-content           61.1      62.6      57.4      62.9
-campaigns         60.7      65.6      60.4      66.7
+section        cold ms    p50 ms    p95 ms    min ms    max ms
+collections        3.8       2.9       3.8       2.8       3.9
+files              3.8       4.1       4.2       3.7       4.3
+content           46.0      27.8      29.9      27.1      30.1
+campaigns         32.3      37.1      39.4      33.2      39.4
 ```
 
 Each number is a whole request, template rendering included, because that is
-what the reader waits for. The handler runs its four `totals` queries for every
-section, so a costly count shows up in all four rows; what separates the rows is
-the section's own page query. `--json` prints the same measurements as a single
-object for a regression check. `--db PATH` writes the synthetic catalogue
-somewhere you keep, and refuses a path that already exists so it can never
-overwrite `library.db`. `--runs`/`--warmup` control the sample, `--seed` fixes
-the generated rows, and p50/p95 are the linear-interpolated percentiles.
+what the reader waits for. Only the section being displayed computes a total
+(#3), so a costly count shows up in one row and in one column: `cold` empties
+the totals cache before each sample — three of them, and the fastest is
+reported, because timing noise only ever adds time — so it is the only column
+that pays the count, while `p50`/`p95`/`min`/`max` are repeats inside the 60 s
+cache that holds a total, the cheap case a reader sees when they page through
+results. `cold` is cold of that cache and not of the disk: the untimed request
+before it has already read the pages, so the file cache is warm. `campaigns` is
+the exception to all of it: it rebuilds its catalogue on every request, so
+nothing is cached there and its `cold` column is only the fastest of three
+samples of the same work. `--json` prints the same measurements as a single
+object for a regression check, including every cold sample. `--db PATH` writes
+the synthetic catalogue somewhere you keep, and refuses a path that already
+exists so it can never overwrite `library.db`. `--runs`/`--warmup` control the
+sample, `--seed` fixes the generated rows, and p50/p95 are the
+linear-interpolated percentiles.
 
 The timings belong to the machine that produced them and to a synthetic
 catalogue; they are comparable to each other — same `--files`, `--pages` and
