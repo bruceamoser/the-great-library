@@ -20,17 +20,19 @@ The rules
    synthetic set.  This is a backstop against collapse, not a benchmark: the
    structural rules above are exact and deterministic.
 
-Rules that are not enforced yet
--------------------------------
+Parking a rule behind an open issue
+-----------------------------------
 
-Rules 1-3 describe the end state of work that is still open.  While such a rule
-fails, its test is *skipped* with a message naming the issue whose fix removes
-the offending statement; that list is ``PENDING`` below.  Once the rule starts
-passing the rule is no longer skipped and the test raises a ``UserWarning``
-asking for the entry to be deleted - deleting one line turns the check into a
-hard gate.  ``RPG_PERF_STRICT=1`` enforces the pending rules immediately, which
-is the intended CI setting once #3 and #4 are merged; ``RPG_PERF_LATENCY_MS``
-overrides the latency budget.
+All four rules are hard gates today: ``PENDING`` below is empty, because the work
+they were waiting on has landed (#3 made the section totals lazy and cached, #4
+moved the filename and classification searches onto ``files_fts``).  The
+mechanism is kept for the next rule that has to land in a later change - a rule
+listed in ``PENDING`` with the issue that removes the offending statement is
+*skipped* with that issue named instead of failing, its test raises a
+``UserWarning`` once the rule starts passing, and deleting the entry turns the
+check into a hard gate.  ``RPG_PERF_STRICT=1`` (set in CI) enforces any pending
+rule immediately even before its issue lands; ``RPG_PERF_LATENCY_MS`` overrides
+the latency budget.
 
 Keeping the fixture honest
 --------------------------
@@ -71,13 +73,10 @@ LATENCY_BUDGET_MS = float(os.environ.get('RPG_PERF_LATENCY_MS') or 250)
 TIMING_REPEATS = 3
 STRICT = os.environ.get('RPG_PERF_STRICT') == '1'
 
-# rule name -> the open issue(s) whose fix removes the offending statement
-PENDING = {
-    'default_does_not_scan_files': (3,),
-    'query_does_not_count_content': (3,),
-    'query_does_not_like_scan_files': (4,),
-    'query_sections_do_not_scan_files': (3,),
-}
+# rule name -> the open issue(s) whose fix removes the offending statement.
+# Empty: every rule passes today, so every rule is enforced.  Add an entry only
+# while the rule fails and an issue is open to fix it.
+PENDING = {}
 RULES = {
     'default_does_not_count_content',
     'default_does_not_like_scan_files',
