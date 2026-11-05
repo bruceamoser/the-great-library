@@ -635,6 +635,8 @@ rpg-app/
   covers/                on-demand shelf cover cache
   thumbnails.py          pre-generates the thumbnail cache (see below)
   mcp_server.py          MCP server for AI assistants (see section 11)
+  benchmarks/search_bench.py   offline /search benchmark (see below)
+  tests/                 unittest suite; needs no library data
   .venv/                 Python 3.14 virtualenv
 ```
 
@@ -709,6 +711,71 @@ Mutating endpoints return **409** if the conflicting job is already running:
 sync refuses while indexing, and rescan/index refuse while the other runs.
 "Already running" covers indexers started from the shell — the app scans `/proc`
 for `index_pdf_text.py` rather than relying only on its own job registry.
+
+### Measuring search performance
+
+`/search` is the slowest surface in the app, and on the live catalogue its
+slowest query is the **total**, not the page of results: on 2026-11-04, on the
+host's spinning disk, a content count over 309,790 indexed pages took 16,006 ms
+where the same count on NVMe took 70 ms. Two tools make that measurable instead
+of guesswork.
+
+**`benchmarks/search_bench.py`** builds a synthetic catalogue using the real
+schemas (`catalog.SCHEMA`, `index_pdf_text.SCHEMA`, and the tables
+`classification`/`taxonomy`/`metadata` create) in a throwaway SQLite file, then
+drives the actual `/search` route through FastAPI's in-process test client, once
+per section. No library data, no server started, no network.
+
+```sh
+.venv/bin/python benchmarks/search_bench.py                        # 5,000 files / 50,000 pages
+.venv/bin/python benchmarks/search_bench.py --files 25227 --pages 309790 --collections 763
+.venv/bin/python benchmarks/search_bench.py --runs 10 --query ''    # filter mode, no query
+```
+
+```
+synthetic catalogue  5,000 files  50,000 pages  152 collections  (built in 0.6 s)
+query                'dragon'   5 run(s), 1 warm-up
+db                   /tmp/rpg-search-bench-y_uw2zo4/bench.db (deleted)
+
+section         p50 ms    p95 ms    min ms    max ms
+collections       42.3      43.7      41.6      44.0
+files             45.1      46.5      43.9      46.9
+content           60.3      64.3      58.7      64.8
+campaigns         60.0      60.9      59.6      61.2
+```
+
+Each number is a whole request, template rendering included, because that is
+what the reader waits for. The handler runs its four `totals` queries for every
+section, so a costly count shows up in all four rows; what separates the rows is
+the section's own page query. `--json` prints the same measurements as a single
+object for a regression check. `--db PATH` writes the synthetic catalogue
+somewhere you keep, and refuses a path that already exists so it can never
+overwrite `library.db`. `--runs`/`--warmup` control the sample, `--seed` fixes
+the generated rows, and p50/p95 are the linear-interpolated percentiles.
+
+The timings belong to the machine that produced them and to a synthetic
+catalogue; they are comparable to each other — same `--files`, `--pages` and
+`--query` — not to the numbers in section 9's neighbours or to a live page. Run
+it on the host when the question is about the host's disk.
+
+The default query hits roughly 1 page in 20, which keeps a content search big
+enough to be worth timing; `--query ''` benchmarks filter-only browsing.
+
+**Slow-request log.** Any request slower than `RPG_SLOW_LOG_MS` (default 250,
+`0` disables) writes one line to stderr with method, path, `section` and
+duration:
+
+```
+slow GET /search section=content 16006ms status=200
+```
+
+Nothing needs configuring: the app attaches a handler to the `rpg.slow` logger
+because uvicorn configures only its own. Under systemd (`rpg-library.service`)
+the line lands in `journalctl -u rpg-library`; started by `./manage.sh` it goes
+to `uvicorn.log`, which `./manage.sh logs` tails. Two limits worth knowing: a
+streamed response (a file from `/raw`, a thumbnail) is timed up to its headers
+rather than to its last byte, and the log records the `section` parameter but
+not the search terms themselves.
 
 ---
 
