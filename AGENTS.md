@@ -109,6 +109,9 @@ checkout's local git config already routes pushes through the same helper.
   `index_pdf_text.py` owns the PDF full-text index; `taxonomy.py` holds the
   classification rules.
 - Mutating endpoints require the `X-Library-Request: 1` header.
+- `/search` caches each tab total for 60 s, so an endpoint that changes what a
+  count reads — a rename, a classification edit, a catalogue rebuild — calls
+  `clear_search_totals()` before it returns.
 - Maintenance endpoints are loopback-only unless `RPG_ADMIN_TOKEN` is set.
 - Do not delete `library.db`: `catalog.py` drops and recreates only the catalogue
   tables, and `pdf_pages` / `pdf_fts` / `pdf_status` must survive a rescan.
