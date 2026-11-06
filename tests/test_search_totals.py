@@ -66,6 +66,41 @@ class SearchTotals(unittest.TestCase):
     def tabs(self, html):
         return html.split('aria-label="Result type">')[1].split('</nav>')[0]
 
+    def nav(self, html):
+        return html.split('aria-label="Results pages">')[1].split('</nav>')[0]
+
+    def make_files(self, count):
+        """Add text files to the fixture collection and rescan.
+
+        Text files are catalogued the same way PDFs are, so this is enough to
+        fill more than one page of the "Books & assets" tab without rendering
+        PDFs.
+        """
+        for i in range(count):
+            (self.folder/'Extra-{:03d}.txt'.format(i)).write_text('bulk note')
+        self.scan()
+
+    def refusing_counts(self):
+        """Patch app.db so a COUNT(*) is refused, as a locked database would."""
+        import app
+        real_db = app.db
+        state = {'busy': True}
+
+        class BusyConnection:
+            def __init__(self, con):
+                self._con = con
+
+            def execute(self, sql, *args, **kwargs):
+                if state['busy'] and 'COUNT(*)' in sql.upper():
+                    raise sqlite3.OperationalError('database is locked')
+                return self._con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+
+        app.db = lambda: BusyConnection(real_db())
+        return state, real_db
+
     def test_default_search_counts_only_the_visible_tab(self):
         response, sql = self.traced_get('/search')
         self.assertEqual(response.status_code, 200)
@@ -350,6 +385,86 @@ class SearchTotals(unittest.TestCase):
         # rewound to 1 by a page count derived from the unanswerable zero.
         self.assertIn('<span>Page 2</span>', failed_deep.text)
         self.assertIn('· {} results'.format(expected), recovered.text)
+
+    def test_a_full_page_offers_the_next_one_when_the_total_is_unknown(self):
+        """Without a total, a full page is the only evidence another page exists.
+
+        There is no page count to compare against, so the link has to come from
+        the page being full. Offering it on a short page would be a dead end;
+        withholding it on a full one would hide real results.
+        """
+        import app
+        self.make_files(38)                       # 2 fixture files + 38 = 40, two pages
+        app.clear_search_totals()
+        client = self.client()
+        state, real_db = self.refusing_counts()
+        try:
+            first = client.get('/search?section=files')
+            second = client.get('/search?section=files&page=2')
+            state['busy'] = False
+            healthy = client.get('/search?section=files')
+            empty = client.get('/search?q=zzzznothing&section=files')
+        finally:
+            app.db = real_db
+        # A full first page (36 of 40) offers the next one, and still states no
+        # total it could not count.
+        self.assertIn('Next page', first.text)
+        self.assertIn('<span>Page 1</span>', self.nav(first.text))
+        self.assertNotIn(' results', self.nav(first.text))
+        # The short second page is the end: no dead-end link.
+        self.assertIn('<span>Page 2</span>', self.nav(second.text))
+        self.assertIn('← Previous', second.text)
+        self.assertNotIn('Next page', second.text)
+        # A healthy request still derives both from the real total.
+        self.assertIn('Page 1 of 2 · 40 results', healthy.text)
+        self.assertIn('Next page', healthy.text)
+        # And a genuinely empty result set still says so.
+        self.assertIn('Nothing found.', empty.text)
+
+    def test_an_empty_page_is_not_an_empty_library(self):
+        """A page past the end must not report the library as empty.
+
+        With no total, the route no longer rewinds a deep page to page 1 -- so
+        the page can come back empty while earlier pages hold results. Saying
+        "Nothing found." there would claim an empty library the database never
+        reported, the same lie as stating an uncountable total.
+        """
+        import app
+        app.clear_search_totals()
+        client = self.client()
+        state, real_db = self.refusing_counts()
+        try:
+            beyond = client.get('/search?section=files&page=5')
+            beyond_query = client.get('/search?q=note&section=files&page=5')
+            state['busy'] = False
+            healthy = client.get('/search?section=files&page=5')
+        finally:
+            app.db = real_db
+        self.assertEqual(200, beyond.status_code)
+        self.assertNotIn('Nothing found.', beyond.text)
+        self.assertIn('No results on this page.', beyond.text)
+        self.assertIn('← Previous', beyond.text)          # there is somewhere to go
+        self.assertNotIn('Nothing found.', beyond_query.text)
+        # A healthy deep page is still clamped to the last real page, so the
+        # message it gained is unreachable there.
+        self.assertIn('Page 1 of 1 · 2 results', healthy.text)
+        self.assertNotIn('No results on this page.', healthy.text)
+
+    def test_content_hits_on_another_tab_are_not_nothing(self):
+        """An empty campaign list is not an empty page.
+
+        The campaigns tab renders the "Inside books" hits as well, so the
+        empty-state cannot be decided from the active section's list alone --
+        that would print "Nothing found." above a table of hits, which is the
+        very claim this branch exists to stop making.
+        """
+        import app
+        self.build_index()
+        app.clear_search_totals()
+        response = self.client().get('/search?q=dragon&section=campaigns')
+        self.assertEqual(200, response.status_code)
+        self.assertIn('Inside documents', response.text)     # hits are on the page
+        self.assertNotIn('Nothing found.', response.text)
 
 
 if __name__ == '__main__':

@@ -101,8 +101,10 @@
 </table>
 {% endif %}
 
-{% if mode and not collections and not files and not content_hits and not campaigns %}
+{% if mode and no_results %}
 <p class="muted">Nothing found.</p>
+{% elif mode and empty_page %}
+<p class="muted">No results on this page.</p>
 {% endif %}
 
 <nav class="pagination" aria-label="Results pages">{% if page>1 %}<a class="quiet-button" href="{{ result_url(page=page-1) }}">← Previous</a>{% endif %}<span>Page {{ page }}{% if pages %} of {{ pages }}{% endif %}{% if totals.get(section) is not none %} · {{ '{:,}'.format(totals[section]) }} results{% endif %}</span>{% if next_page %}<a class="gold-button" href="{{ result_url(page=page+1) }}">Next page →</a>{% endif %}</nav>

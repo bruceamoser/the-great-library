@@ -657,6 +657,15 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
     shown={'collections':len(collections),'files':len(files),
            'content':len(content_hits),'campaigns':len(campaign_page)}[section]
     next_page=shown>=size if pages is None else page<pages
+    # The page is blank only when it rendered no list at all -- the "Inside
+    # books" hits are shown on the campaigns tab too, so this cannot be decided
+    # from the active section alone. And blank only means the library has
+    # nothing when it is the first page: with no total, a deep page can come
+    # back empty because its results are on an earlier page, and "Nothing found."
+    # there would report an empty library the database never said was empty.
+    blank=not (collections or files or content_hits or campaign_page)
+    no_results=blank and page==1
+    empty_page=blank and page>1
     all_tags=con.execute('SELECT name FROM tags ORDER BY name').fetchall()
     shelves=con.execute('SELECT DISTINCT shelf FROM collections ORDER BY shelf').fetchall()
     con.close()
@@ -670,6 +679,7 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         all_tags=all_tags,shelves=shelves,shelf_label=shelf_label,kinds=KIND_ORDER,
         cats=CATEGORY_ORDER,subcats=SUBCATEGORY,category_label=CATEGORY_LABEL,
         subcategory_label=SUBCATEGORY_LABEL,totals=totals,page=page,pages=pages,next_page=next_page,
+        no_results=no_results,empty_page=empty_page,
         section=section,sort=sort,result_url=result_url,index_available=index_available))
 
 
