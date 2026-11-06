@@ -450,6 +450,40 @@ class SearchTotals(unittest.TestCase):
         self.assertIn('Page 1 of 1 · 2 results', healthy.text)
         self.assertNotIn('No results on this page.', healthy.text)
 
+    def test_a_hand_typed_page_cannot_outrun_the_offset(self):
+        """Without a total, nothing bounded the page number.
+
+        The page count normally clamps `page`, and with it the OFFSET. With no
+        total there is no page count, and `page` comes straight from the query
+        string -- so a hand-typed number reached SQLite as an unbounded OFFSET,
+        which it binds as a 64-bit integer: a large enough page raised
+        OverflowError and answered 500 in the one state where the database is
+        already busy. The page is now bounded, and it still renders.
+        """
+        import app
+        app.clear_search_totals()
+        client = self.client()
+        absurd = '/search?section=files&page=%d' % 10**30
+        state, real_db = self.refusing_counts()
+        try:
+            forced = client.get(absurd)
+            normal = client.get('/search?section=files&page=2')
+            state['busy'] = False
+            healthy = client.get(absurd)
+        finally:
+            app.db = real_db
+        self.assertEqual(200, forced.status_code)
+        # Bounded, and reported as the page actually rendered.
+        self.assertIn('<span>Page %d</span>' % app.SEARCH_PAGE_LIMIT,
+                      self.nav(forced.text))
+        self.assertNotIn(' results', self.nav(forced.text))   # still no total
+        self.assertIn('← Previous', forced.text)              # and a way back
+        # A page inside the bound is untouched, so the cap only catches numbers
+        # no click can produce.
+        self.assertIn('<span>Page 2</span>', self.nav(normal.text))
+        # A known total still clamps to the last real page, exactly as before.
+        self.assertIn('Page 1 of 1 · 2 results', healthy.text)
+
     def test_content_hits_on_another_tab_are_not_nothing(self):
         """An empty campaign list is not an empty page.
 

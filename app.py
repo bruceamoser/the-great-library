@@ -582,6 +582,16 @@ def has_pdf_index(con) -> bool:
         return False
 
 
+# Normally the page count bounds `page`, and with it the OFFSET handed to
+# SQLite. When the total is unknown there is no page count, so the page number
+# arrives unvalidated from the query string: SQLite binds OFFSET as a 64-bit
+# integer and raises OverflowError (a 500) on anything larger, and a merely
+# large one becomes a long scan. This is comfortably above any real page count
+# -- the live catalogue's largest section is ~8,600 pages of 36 -- so it only
+# ever bites on a hand-typed number.
+SEARCH_PAGE_LIMIT = 10000
+
+
 @app.get('/search', response_class=HTMLResponse)
 def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
            tag: str = '', cat: str = '', subcat: str = '',
@@ -637,8 +647,9 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         # The database would not answer this count. Deriving a page count from
         # it would state a false "0 results" beside a table of hits and rewind a
         # deep page to page 1, so say nothing about the total and leave the
-        # requested page alone.
-        pages=None
+        # requested page alone -- but bound it, since the page count is what
+        # used to bound the OFFSET.
+        pages=None; page=min(page,SEARCH_PAGE_LIMIT)
     else:
         pages=max(1,(total+size-1)//size); page=min(page,pages)
     offset=(page-1)*size
