@@ -281,12 +281,33 @@ class SearchTotals(unittest.TestCase):
         self.assertIsNone(app.count_rows(Refusing('disk I/O error'), 'x'))
         self.assertEqual(7, app.count_rows(Answering(), 'x'))
 
-    def test_a_failed_count_is_not_remembered(self):
-        """One busy moment must not read "Nothing found" for the whole TTL.
+    def test_an_unanswerable_count_is_not_a_total(self):
+        """Unknown is not zero, and neither is it remembered.
 
-        A locked database makes the count unable to answer. The request that hit
-        the lock shows a zero, but the cache must stay empty so the next request
-        asks again instead of serving the failure for a minute.
+        A real zero -- "the index has not been built" -- is a total worth
+        caching. A count that could not be answered is not a total at all, so
+        `search_total` hands back the unknown instead of inventing a zero, and
+        nothing is stored for the next request to serve.
+        """
+        import app
+        key = (self.db, 'content', 'dragon', '', '', '', '', '')
+        app.clear_search_totals()
+        with patch.object(app.time, 'monotonic', return_value=1000.0):
+            self.assertIsNone(app.search_total(key, lambda: None))
+            self.assertIsNone(app.search_total(key, lambda: None))   # asked again
+        self.assertNotIn(key, app._search_totals)
+        with patch.object(app.time, 'monotonic', return_value=1000.0):
+            self.assertEqual(0, app.search_total(key, lambda: 0))
+        self.assertIn(key, app._search_totals)                       # a zero is a total
+
+    def test_a_failed_count_is_not_remembered(self):
+        """One busy moment must not read "0 results" for the whole TTL.
+
+        A locked database makes the count unable to answer. The page must not
+        state a total it could not count -- and must not derive a page count
+        from it either, which used to rewind a deep page to page 1 -- while the
+        cache stays empty so the next request asks again instead of serving the
+        failure for a minute.
         """
         import app
         self.build_index()
@@ -314,12 +335,20 @@ class SearchTotals(unittest.TestCase):
         try:
             app.db = lambda: BusyConnection(real_db())
             failed = client.get('/search?q=dragon&section=content')
+            failed_deep = client.get('/search?q=dragon&section=content&page=2')
             state['busy'] = False
             recovered = client.get('/search?q=dragon&section=content')
         finally:
             app.db = real_db
         self.assertEqual(failed.status_code, 200)
-        self.assertIn('· 0 results', failed.text)
+        # The hits are still listed, but the page says nothing about a total it
+        # could not count -- no "· 0 results", no "of 1", no badge count.
+        self.assertIn('<span>Page 1</span>', failed.text)
+        self.assertNotIn('· 0 results', failed.text)
+        self.assertNotRegex(self.tabs(failed.text), r'Inside books\s*<span>')
+        # A deep page keeps the page the reader asked for instead of being
+        # rewound to 1 by a page count derived from the unanswerable zero.
+        self.assertIn('<span>Page 2</span>', failed_deep.text)
         self.assertIn('· {} results'.format(expected), recovered.text)
 
 

@@ -105,5 +105,5 @@
 <p class="muted">Nothing found.</p>
 {% endif %}
 
-<nav class="pagination" aria-label="Results pages">{% if page>1 %}<a class="quiet-button" href="{{ result_url(page=page-1) }}">← Previous</a>{% endif %}<span>Page {{ page }} of {{ pages }} · {{ '{:,}'.format(totals[section]) }} results</span>{% if page<pages %}<a class="gold-button" href="{{ result_url(page=page+1) }}">Next page →</a>{% endif %}</nav>
+<nav class="pagination" aria-label="Results pages">{% if page>1 %}<a class="quiet-button" href="{{ result_url(page=page-1) }}">← Previous</a>{% endif %}<span>Page {{ page }}{% if pages %} of {{ pages }}{% endif %}{% if totals.get(section) is not none %} · {{ '{:,}'.format(totals[section]) }} results{% endif %}</span>{% if next_page %}<a class="gold-button" href="{{ result_url(page=page+1) }}">Next page →</a>{% endif %}</nav>
 {% endblock %}

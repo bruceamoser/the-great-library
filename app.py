@@ -517,10 +517,10 @@ def search_total(key, compute):
     value = compute()
     if value is None:
         # The count could not be answered -- the database was busy or being
-        # rebuilt. Show the zero to this request, but never remember it: one
-        # hiccup would otherwise read "Nothing found" for the rest of the TTL,
-        # long after the catalogue was healthy again.
-        return 0
+        # rebuilt. Return the unknown, never a zero and never a remembered
+        # value: one hiccup would otherwise read "0 results" for the rest of
+        # the TTL, long after the catalogue was healthy again.
+        return None
     # The window starts when the count *finishes*, not when it was asked for:
     # the content total takes 16 s on the live HDD catalogue, and timing it from
     # the start would quietly shorten the advertised minute to 44 s for exactly
@@ -555,8 +555,9 @@ def count_rows(con, sql, args=()):
 
     A missing table or column is the documented "index has not been built yet"
     case and is a real zero. Anything else -- database is locked, disk I/O -- is
-    a transient failure, and saying 0 would report an empty library; returning
-    None lets the caller show a zero without remembering it.
+    a transient failure, and saying 0 would report an empty library. Returning
+    None lets the caller leave the total unstated and remember nothing, so the
+    next request asks again.
     """
     try:
         return con.execute(sql, args).fetchone()[0]
@@ -631,7 +632,15 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         totals['content']=search_total(key,lambda: count_rows(con,'SELECT COUNT(*)'+pj+pw,pp))
     else:
         totals['content']=0
-    pages=max(1,(totals[section]+size-1)//size); page=min(page,pages)
+    total=totals[section]
+    if total is None:
+        # The database would not answer this count. Deriving a page count from
+        # it would state a false "0 results" beside a table of hits and rewind a
+        # deep page to page 1, so say nothing about the total and leave the
+        # requested page alone.
+        pages=None
+    else:
+        pages=max(1,(total+size-1)//size); page=min(page,pages)
     offset=(page-1)*size
     collections=[]; files=[]; content_hits=[]
     if section=='collections':
@@ -642,6 +651,12 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         files=con.execute('SELECT f.*,c.name collection_name,c.shelf'+join+fw+' ORDER BY '+order+' LIMIT ? OFFSET ?',fp+[size,offset]).fetchall()
     elif match and index_available:
         content_hits=con.execute("SELECT f.id fid,pp.page,f.filename,c.id cid,c.name collection_name,c.shelf,snippet(pdf_fts,0,'<<','>>',' … ',24) snip"+pj+pw+' ORDER BY rank LIMIT ? OFFSET ?',pp+[size,offset]).fetchall()
+    campaign_page=campaign_items[offset:offset+size]
+    # With no total there is no page count to compare against, so a full page is
+    # the only evidence available that another one exists.
+    shown={'collections':len(collections),'files':len(files),
+           'content':len(content_hits),'campaigns':len(campaign_page)}[section]
+    next_page=shown>=size if pages is None else page<pages
     all_tags=con.execute('SELECT name FROM tags ORDER BY name').fetchall()
     shelves=con.execute('SELECT DISTINCT shelf FROM collections ORDER BY shelf').fetchall()
     con.close()
@@ -651,10 +666,10 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         return '/search?'+urlencode({k:v for k,v in values.items() if v!=''})
     return templates.TemplateResponse(request,'search.html',dict(
         q=q,shelf=shelf,kind=kind,tag=tag,cat=cat,subcat=subcat,mode='query' if q else 'filter',
-        campaigns=campaign_items[offset:offset+size],collections=collections,files=files,content_hits=content_hits,highlight=highlight,
+        campaigns=campaign_page,collections=collections,files=files,content_hits=content_hits,highlight=highlight,
         all_tags=all_tags,shelves=shelves,shelf_label=shelf_label,kinds=KIND_ORDER,
         cats=CATEGORY_ORDER,subcats=SUBCATEGORY,category_label=CATEGORY_LABEL,
-        subcategory_label=SUBCATEGORY_LABEL,totals=totals,page=page,pages=pages,
+        subcategory_label=SUBCATEGORY_LABEL,totals=totals,page=page,pages=pages,next_page=next_page,
         section=section,sort=sort,result_url=result_url,index_available=index_available))
 
 
