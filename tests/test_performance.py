@@ -140,6 +140,18 @@ LEADING_WILDCARD = {'like': '%', 'glob': '*'}
 CONTENT_TABLES = re.compile(r'\bpdf_(?:fts|pages)\b', re.I)
 COUNT_CALL = re.compile(r'\bCOUNT\s*\(', re.I)
 PLAN_SCAN = re.compile(r'\s*SCAN\s+([A-Za-z_]\w*)', re.I)
+# A statement that *reads* files_fts, as opposed to one that merely mentions
+# the name: `has_files_index()` probes `sqlite_master` with
+# `name = 'files_fts'`, which every files request records, so a bare
+# `'files_fts' in sql` test is satisfied by the probe alone and stays green
+# when the section stops using the index.  JOIN is allowed because reading the
+# index through a join is as good as through `id IN (SELECT ...)`; a
+# schema-qualified `main.files_fts` would not match, which is the one rewrite
+# this would have to be taught about, and nothing in the tree uses one.
+FILES_FTS_READ = re.compile(r'\b(?:FROM|JOIN)\s+files_fts\b', re.I)
+# Only a SELECT or a WITH can be a read; `catalog.rebuild_files_fts()` issues
+# `DELETE FROM files_fts`, which would otherwise satisfy FILES_FTS_READ.
+READ_STATEMENT = re.compile(r'\s*(?:SELECT|WITH)\b', re.I)
 
 
 # --------------------------------------------------------------- statements ---
@@ -379,7 +391,7 @@ class SearchPerformanceTests(unittest.TestCase):
         """
         found = []
         for sql, params in statements:
-            if not re.match(r'\s*(SELECT|WITH)\b', sql, re.I):
+            if not READ_STATEMENT.match(sql):
                 continue
             try:
                 rows = self.explain.execute('EXPLAIN QUERY PLAN ' + sql, params).fetchall()
@@ -448,15 +460,23 @@ class SearchPerformanceTests(unittest.TestCase):
         It was exempt from the plan rule until the exemption was caught hiding
         a full scan, so pin both halves: that the rule covers it, and that the
         request is answered from `files_fts` rather than from the table.
+
+        The second half matches a statement that *reads* ``files_fts``, not one
+        that mentions it: `has_files_index()` probes ``sqlite_master`` with
+        ``name = 'files_fts'`` on every files request, so a bare substring test
+        is satisfied by that probe and stays green when the section stops using
+        the index altogether.
         """
         self.assertIn(
             'files', FILTERED_URLS,
             'section=files was exempted from the plan rule again; it queries the '
             'files table, so an exemption hides a reintroduced scan there')
         self.assertTrue(
-            any('files_fts' in sql for sql, _params in self.statements('files')),
-            'the files section executed no statement against files_fts, so the '
-            'plan rule has no index path to check')
+            any(FILES_FTS_READ.search(sql)
+                for sql, _params in self.statements('files')
+                if READ_STATEMENT.match(sql)),
+            'the files section executed no statement that reads FROM or JOIN '
+            'files_fts, so the plan rule has no index path to check')
 
     def test_gate_measures_the_indexed_search_path(self):
         """The rules describe the indexed path, so pin where that path begins.
