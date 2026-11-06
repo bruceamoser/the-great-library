@@ -35,8 +35,25 @@ The rules
 Every rule is enforced: there is no skip list, so a reintroduced full scan or an
 eagerly paid count always fails the suite rather than being parked on an issue.
 All four pass today because #3 made the section totals lazy and cached and #4
-moved the filename and classification searches onto ``files_fts``.
+moved the filename and classification searches onto ``files_fts`` - for queries
+of ``FTS_MIN_CHARS`` characters or more, which is what the requests below use.
 ``RPG_PERF_LATENCY_MS`` overrides the latency budget for a slower machine.
+
+What these rules do not cover
+-----------------------------
+
+``files_filter`` keeps the old substring scan below ``FTS_MIN_CHARS`` (three
+characters), because an FTS5 prefix of one or two characters matches most of
+the library and the results would be useless.  That fallback is deliberate - #10
+introduced it and ``test_files_search`` pins it - and it *is* a leading-wildcard
+``LIKE`` over ``files``, the same count #10 measured at 2,779 ms on the host
+catalogue.  So rules 2 and 3 describe the **indexed** path, which every request
+in ``URLS`` takes; they do not claim ``/search`` never scans ``files`` for every
+possible input.  ``test_gate_measures_the_indexed_search_path`` pins that
+boundary, so raising ``FTS_MIN_CHARS`` past the length of ``QUERY`` fails here
+rather than quietly moving every rule onto a path it does not describe.
+Removing the fallback would change search results, so it is a product decision
+rather than something this gate should decide by assertion.
 
 Keeping the fixture honest
 --------------------------
@@ -86,12 +103,14 @@ URLS = {
 # Everything else - ``section=files`` included - is answered from an index.
 # ``section=files`` used to be exempt on the grounds that it "pages through
 # matching files, so it walks the table by design", which stopped being true
-# when #4 moved the filename search onto ``files_fts``: the live plan there is
-# ``SCAN files_fts``, never ``SCAN f``.  While it was exempt, replacing the
-# ``files_fts`` restriction with ``INSTR(f.filename, ?) > 0`` - or with
-# ``COALESCE(f.filename,'') LIKE ?``, which the like rule cannot see because
-# the adjacency is broken - reintroduced a full scan of ``files`` in the one
-# section that queries it and the suite stayed green.
+# when #4 moved the filename search onto ``files_fts``: for a query of
+# ``FTS_MIN_CHARS`` characters or more the live plan there is ``SCAN
+# files_fts``, never ``SCAN f``.  (Shorter queries keep the substring scan by
+# design - see "What these rules do not cover" above.)  While it was exempt,
+# replacing the ``files_fts`` restriction with ``INSTR(f.filename, ?) > 0``, or
+# with ``COALESCE(f.filename,'') LIKE ?`` - which the like rule cannot see
+# because the adjacency is broken - reintroduced a full scan of ``files`` in
+# the one section that queries it, and the suite stayed green.
 FILTERED_URLS = {name: url for name, url in URLS.items() if name != 'default'}
 
 FILES_COLUMNS = {
@@ -438,6 +457,42 @@ class SearchPerformanceTests(unittest.TestCase):
             any('files_fts' in sql for sql, _params in self.statements('files')),
             'the files section executed no statement against files_fts, so the '
             'plan rule has no index path to check')
+
+    def test_gate_measures_the_indexed_search_path(self):
+        """The rules describe the indexed path, so pin where that path begins.
+
+        ``files_filter`` deliberately keeps the substring scan below
+        ``FTS_MIN_CHARS`` (an FTS5 prefix of one or two characters matches most
+        of the library), so every rule above only means what it says while the
+        requests in ``URLS`` are at or above that length.  Two separate guards:
+
+        * the gate's own query is at least ``FTS_MIN_CHARS`` long, so raising
+          the threshold cannot silently move every rule onto the fallback while
+          the suite stays green;
+        * a query of exactly ``FTS_MIN_CHARS`` characters is still answered
+          from the index, so the boundary itself cannot drift by one without
+          this failing.
+
+        Neither asserts anything about the fallback below the threshold: it is
+        deliberate, pinned by ``test_files_search``, and removing it would
+        change search results.
+        """
+        import app
+        self.assertGreaterEqual(
+            len(QUERY.strip()), app.FTS_MIN_CHARS,
+            f'the gate searches for {QUERY!r}, shorter than FTS_MIN_CHARS '
+            f'({app.FTS_MIN_CHARS}), so the rules would measure the substring '
+            'fallback instead of the indexed search')
+        url = f'/search?q={QUERY.strip()[:app.FTS_MIN_CHARS]}&section=files'
+        _response, _elapsed, statements = self.run_request(url)
+        offenders = [offender
+                     for offender in map(like_scan_on_files, statements)
+                     if offender]
+        offenders += self.plans(statements)
+        self.assertEqual(
+            offenders, [],
+            f'a query of exactly FTS_MIN_CHARS characters ({url}) fell back to '
+            'the substring scan:\n\n    ' + '\n\n    '.join(offenders))
 
     def test_unplannable_statements_are_reported_not_skipped(self):
         """A statement SQLite will not plan must fail, not vanish from the rule."""
