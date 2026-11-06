@@ -20,9 +20,12 @@ The rules
    literal, a positional binding or a named one, and even when the column is
    wrapped in a function such as ``lower()``.  The live files total is a 2.8 s
    query.
-3. ``no_files_scan`` - no plan step that scans ``files`` end to end, for the
-   sections that have an index path.  ``section=files`` is exempt: it pages
-   through matching files, so it walks the table by design.
+3. ``no_files_scan`` - no plan step that scans ``files`` end to end, in every
+   section.  ``section=files`` is included: since #4 its search reads
+   ``files_fts``, so the plan is ``SCAN files_fts`` and walking ``files``
+   there is the very regression this file exists for.  It was exempt until
+   that exemption was found to hide a scan - see the note on
+   ``FILTERED_URLS``.
 4. Latency - each cold section answers well inside a generous budget on the
    synthetic set.  The totals cache is emptied before each sample, so the
    figure covers the query the section genuinely needs rather than a cache
@@ -79,10 +82,17 @@ URLS = {
     'content': f'/search?q={QUERY}&section=content',
     'campaigns': f'/search?q={QUERY}&section=campaigns',
 }
-# section=files pages through matching files, so it walks the table by design;
-# the default request has its own rule
-FILTERED_URLS = {name: url for name, url in URLS.items()
-                 if name not in ('default', 'files')}
+# The default request has its own rule, so it is the only section left out.
+# Everything else - ``section=files`` included - is answered from an index.
+# ``section=files`` used to be exempt on the grounds that it "pages through
+# matching files, so it walks the table by design", which stopped being true
+# when #4 moved the filename search onto ``files_fts``: the live plan there is
+# ``SCAN files_fts``, never ``SCAN f``.  While it was exempt, replacing the
+# ``files_fts`` restriction with ``INSTR(f.filename, ?) > 0`` - or with
+# ``COALESCE(f.filename,'') LIKE ?``, which the like rule cannot see because
+# the adjacency is broken - reintroduced a full scan of ``files`` in the one
+# section that queries it and the suite stayed green.
+FILTERED_URLS = {name: url for name, url in URLS.items() if name != 'default'}
 
 FILES_COLUMNS = {
     'id', 'collection_id', 'rel_path', 'filename', 'ext', 'kind', 'category',
@@ -341,14 +351,21 @@ class SearchPerformanceTests(unittest.TestCase):
         return self.recorded_request(URLS[name])[2]
 
     def plans(self, statements):
-        """Every scan step of the plan SQLite picks for these statements."""
+        """Every scan step of the plan SQLite picks for these statements.
+
+        A statement SQLite refuses to plan is reported as an offender rather
+        than skipped: a rule that silently ignores what it could not read
+        passes vacuously, which is how a full scan hid in the files section
+        until the exemption there was removed.
+        """
         found = []
         for sql, params in statements:
             if not re.match(r'\s*(SELECT|WITH)\b', sql, re.I):
                 continue
             try:
                 rows = self.explain.execute('EXPLAIN QUERY PLAN ' + sql, params).fetchall()
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                found.append(f'could not be planned ({exc}): {" ".join(sql.split())}')
                 continue
             aliases = files_aliases(sql)
             for row in rows:
@@ -405,6 +422,28 @@ class SearchPerformanceTests(unittest.TestCase):
             offenders += [f'{step}      in {URLS[name]}'
                           for step in self.plans(self.statements(name))]
         self.assert_rule('query_sections_do_not_scan_files', offenders)
+
+    def test_files_section_is_guarded_against_a_scan(self):
+        """The files section is the one place a scan of `files` can reappear.
+
+        It was exempt from the plan rule until the exemption was caught hiding
+        a full scan, so pin both halves: that the rule covers it, and that the
+        request is answered from `files_fts` rather than from the table.
+        """
+        self.assertIn(
+            'files', FILTERED_URLS,
+            'section=files was exempted from the plan rule again; it queries the '
+            'files table, so an exemption hides a reintroduced scan there')
+        self.assertTrue(
+            any('files_fts' in sql for sql, _params in self.statements('files')),
+            'the files section executed no statement against files_fts, so the '
+            'plan rule has no index path to check')
+
+    def test_unplannable_statements_are_reported_not_skipped(self):
+        """A statement SQLite will not plan must fail, not vanish from the rule."""
+        offenders = self.plans([('SELECT ? FROM files', ('a', 'b'))])
+        self.assertEqual(len(offenders), 1, offenders)
+        self.assertIn('could not be planned', offenders[0])
 
     # -- 4. latency backstop ----------------------------------------------
 
