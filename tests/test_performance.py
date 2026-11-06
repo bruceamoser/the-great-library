@@ -53,15 +53,20 @@ characters), because an FTS5 prefix of one or two characters matches most of
 the library and the results would be useless.  That fallback is deliberate - #10
 introduced it and ``test_files_search`` pins it - and it *is* a leading-wildcard
 ``LIKE`` over ``files``, the same count #10 measured at 2,779 ms on the host
-catalogue.  A query that clears the threshold but is left with no word to match
-once ``fts_query`` drops its operators (``q=and``, or punctuation only) falls
-back the same way, because an empty ``MATCH`` cannot run: that too is a
-leading-wildcard ``LIKE`` over ``files``.  So rules 2 and 3 describe the
+catalogue.  Two more inputs reach it at or above the threshold: a query whose
+words ``fts_query`` drops as operators (``q=and``), and one that holds only
+punctuation ``fts_query`` cannot turn into a term (``q=!!!``) - ``-`` and ``'``
+are word characters to it, so ``q=---`` keeps a term and takes the index.  Both
+leave an empty ``MATCH``, which cannot run, so the substring scan answers
+instead: that too is a leading-wildcard ``LIKE`` over ``files``.  A catalogue
+whose ``files_fts`` has not been built yet falls back for every query, because
+``use_fts`` also requires ``has_files_index``.  So rules 2 and 3 describe the
 **indexed** path, which every request in ``URLS`` takes; they do not claim
 ``/search`` never scans ``files`` for every possible input.
-``test_gate_measures_the_indexed_search_path`` pins that boundary, so raising
-``FTS_MIN_CHARS`` past the length of ``QUERY`` fails here rather than quietly
-moving every rule onto a path it does not describe.
+``test_gate_measures_the_indexed_search_path`` pins the length end of that
+boundary and ``test_operator_queries_keep_the_substring_scan`` (in
+``test_files_search``) pins the operator end by result, so moving either fails
+loudly rather than quietly leaving every rule on a path it does not describe.
 Removing the fallback would change search results, so it is a product decision
 rather than something this gate should decide by assertion.
 

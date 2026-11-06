@@ -104,6 +104,21 @@ class FilesSearchTests(unittest.TestCase):
                 ids,_html=self.searched_ids(q)
                 self.assertEqual(ids,set())
 
+    def test_operator_queries_keep_the_substring_scan(self):
+        # fts_query drops AND/OR/NOT/NEAR, so an all-operator query leaves an
+        # empty MATCH; use_fts requires a word, so the substring scan answers.
+        # A mid-token fragment can only be found that way - "and" inside
+        # "Brand", "Not" inside "Notes" - so an empty result here would mean
+        # the route reached the index with the operator instead.
+        realm=self.library/'Books'/'01-DnD-and-d20'/'Test Realm'
+        (realm/'Brand Notes.txt').write_text('notes')
+        self.scan()
+        for q in ['and','not']:
+            with self.subTest(q=q):
+                self.assertTrue(self.old_result(q))
+                ids,_html=self.searched_ids(q)
+                self.assertEqual(ids,self.old_result(q))
+
     def test_manual_classification_refreshes_the_index(self):
         import jobs
         fid=self.query("SELECT id FROM files WHERE filename='Corebook.pdf'")[0][0]

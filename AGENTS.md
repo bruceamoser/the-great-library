@@ -37,18 +37,22 @@ enforced, so a reintroduced scan fails the suite; there is no skip list.
 cold: the totals cache is emptied before each sample, so the figure covers the
 query the section needs rather than a cache hit.
 
-The rules describe the **indexed** path — a query of `FTS_MIN_CHARS` (three)
-characters or more that also leaves a word to match. A one- or two-character
-query deliberately keeps the leading-wildcard `LIKE` scan of `files`, because an
-FTS5 prefix that short matches most of the library; so does a longer query whose
-words are all FTS operators or punctuation (`q=and`, `q=!!!`), which `fts_query`
-reduces to nothing to match. `/search?q=d&section=files` still scans `files`,
-and the gate neither measures those paths nor claims otherwise. "What these
-rules do not cover" in the module docstring has the detail; a test pins the
-boundary, so raising the threshold fails there rather than quietly moving every
-rule onto a path it does not describe. Removing the fallback would change search
-results, so it is a product decision rather than something the gate should
-assert.
+The rules describe the **indexed** path — a query that `use_fts` accepts: the
+catalogue's `files_fts` has been built, the query is at least `FTS_MIN_CHARS`
+(three) characters long, and `fts_query` leaves a word to match. A one- or
+two-character query deliberately keeps the leading-wildcard `LIKE` scan of
+`files`, because an FTS5 prefix that short matches most of the library; so does
+a longer query that `fts_query` reduces to nothing — all FTS operators
+(`q=and`), or only punctuation it cannot turn into a term (`q=!!!`; `-` and `'`
+are word characters to it, so `q=---` still reaches the index).
+`/search?q=d&section=files` still scans `files`, and the gate neither measures
+those paths nor claims otherwise. "What these rules do not cover" in the module
+docstring has the detail. Tests pin both ends of that boundary: raising the
+threshold fails `test_gate_measures_the_indexed_search_path` rather than
+quietly moving every rule onto a path it does not describe, and dropping the
+operator fallback fails `test_operator_queries_keep_the_substring_scan`.
+Removing the fallback would change search results, so it is a product decision
+rather than something the gate should assert.
 
 ## Measuring search
 
