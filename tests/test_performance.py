@@ -9,10 +9,17 @@ an eagerly paid count fails here instead of on the host's spinning disk.
 The rules
 ---------
 
-1. ``no_content_count`` - no ``COUNT(*)`` over ``pdf_fts`` unless the request
-   renders the content section.  The live content total is the 16 s query.
-2. ``no_like_scan`` - no ``LIKE '%...'`` (leading wildcard, so no index) against
-   a column of the ``files`` table.  The live files total is a 2.8 s query.
+1. ``no_content_count`` - no eagerly paid ``COUNT(...)`` over the PDF full-text
+   index unless the request renders the content section.  The live content
+   total is the 16 s query.  ``pdf_fts`` is external content over
+   ``pdf_pages``, so counting either is the same scan, and ``COUNT(1)`` or
+   ``COUNT(rowid)`` costs exactly what ``COUNT(*)`` does - the argument is
+   therefore not restricted to ``*``.
+2. ``no_like_scan`` - no leading-wildcard ``LIKE`` or ``GLOB`` (neither can use
+   an index) against a column of the ``files`` table, whether the pattern is a
+   literal, a positional binding or a named one, and even when the column is
+   wrapped in a function such as ``lower()``.  The live files total is a 2.8 s
+   query.
 3. ``no_files_scan`` - no plan step that scans ``files`` end to end, for the
    sections that have an index path.  ``section=files`` is exempt: it pages
    through matching files, so it walks the table by design.
@@ -92,8 +99,17 @@ FILES_REFERENCE = re.compile(r'\b(?:FROM|JOIN)\s+files\b', re.I)
 FILES_BINDING = re.compile(
     r'\b(?:FROM|JOIN)\s+files\b(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?', re.I)
 LIKE_PATTERN = re.compile(
-    r'([A-Za-z_]\w*\s*\.\s*)?([A-Za-z_]\w*)\s+(?:NOT\s+)?LIKE\s+(\?|\'[^\']*\')',
+    r'(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*\)*\s*'
+    r'(?:COLLATE\s+[A-Za-z_]\w*\s+)?(?:NOT\s+)?(LIKE|GLOB)\s+'
+    r'(\?|:[A-Za-z_]\w*|\'[^\']*\')',
     re.I)
+# the wildcard each operator treats as "match anything", so a leading one
+# defeats an index exactly as LIKE '%x' does
+LEADING_WILDCARD = {'like': '%', 'glob': '*'}
+# `pdf_fts` is external content over `pdf_pages`, so counting either walks the
+# same rows; `COUNT(1)` and `COUNT(rowid)` cost what `COUNT(*)` costs
+CONTENT_TABLES = re.compile(r'\bpdf_(?:fts|pages)\b', re.I)
+COUNT_CALL = re.compile(r'\bCOUNT\s*\(', re.I)
 PLAN_SCAN = re.compile(r'\s*SCAN\s+([A-Za-z_]\w*)', re.I)
 
 
@@ -107,6 +123,11 @@ class RecordingConnection(sqlite3.Connection):
         self.statements = []
 
     def _record(self, sql, parameters):
+        if isinstance(parameters, dict):
+            # Named placeholders: keep the mapping, so the pattern a LIKE binds
+            # stays readable instead of collapsing to a tuple of key names.
+            self.statements.append((sql, dict(parameters)))
+            return
         try:
             stored = tuple(parameters or ())
         except TypeError:  # a generator or a custom sequence
@@ -136,34 +157,48 @@ def files_aliases(sql):
     return aliases
 
 
+def bound_pattern(sql, match, params):
+    """The pattern a LIKE/GLOB match binds, or None when it cannot be read."""
+    placeholder = match.group(4)
+    if placeholder.startswith(':'):
+        return params.get(placeholder[1:]) if isinstance(params, dict) else None
+    if placeholder != '?':           # a literal such as '%dragon%'
+        return placeholder.strip("'")
+    if isinstance(params, dict):     # named bindings, positional placeholder
+        return None
+    position = sql.count('?', 0, match.start(4))
+    return params[position] if position < len(params) else None
+
+
 def like_scan_on_files(statement):
-    """The statement if it applies a leading-wildcard LIKE to a files column."""
+    """The statement if it matches a files column with a leading wildcard.
+
+    The column is matched tightly against the operator - only an optional
+    qualifier, closing parentheses and ``COLLATE`` may sit between them - so a
+    ``LIKE`` on another table in the same statement cannot be blamed on a files
+    column that merely appears earlier in the SQL.
+    """
     sql, params = statement
     if not FILES_REFERENCE.search(sql):
         return None
     aliases = files_aliases(sql)
     for match in LIKE_PATTERN.finditer(sql):
-        qualifier, column, pattern = match.group(1), match.group(2).lower(), match.group(3)
-        if qualifier:
-            if qualifier.replace(' ', '').rstrip('.').lower() not in aliases:
-                continue
-        elif column not in FILES_COLUMNS:
+        qualifier, column, operator = (match.group(1), match.group(2).lower(),
+                                       match.group(3).lower())
+        if column not in FILES_COLUMNS:
             continue
-        if pattern == '?':
-            position = sql.count('?', 0, match.start(3))
-            value = params[position] if position < len(params) else None
-            if not (isinstance(value, str) and value.startswith('%')):
-                continue
-        elif not pattern.startswith("'%"):
+        if qualifier and qualifier.lower() not in aliases:
             continue
-        return ' '.join(sql.split())
+        value = bound_pattern(sql, match, params)
+        if isinstance(value, str) and value.startswith(LEADING_WILDCARD[operator]):
+            return ' '.join(sql.split())
     return None
 
 
 def content_count(statement):
-    """The statement if it counts rows of the PDF full-text index."""
+    """The statement if it eagerly counts rows of the PDF full-text index."""
     sql = statement[0]
-    if 'pdf_fts' not in sql or not re.search(r'COUNT\s*\(\s*\*\s*\)', sql, re.I):
+    if not CONTENT_TABLES.search(sql) or not COUNT_CALL.search(sql):
         return None
     return ' '.join(sql.split())
 
@@ -439,6 +474,78 @@ class SearchPerformanceTests(unittest.TestCase):
                 if re.match(r'\s*SELECT\b', sql, re.I) and not params),
             'EXPLAIN QUERY PLAN returned nothing; the plan rules would pass vacuously')
         self.assertIn('Dragon Compendium', self.recorded_request(URLS['content'])[0].text)
+
+
+class DetectorTests(unittest.TestCase):
+    """Pin the shapes the rules catch, and the ones they must leave alone.
+
+    A rule is only worth anything if it recognises the obvious rewrites of the
+    regression it names: ``COUNT(1)`` costs exactly what ``COUNT(*)`` costs, and
+    ``GLOB '*x*'`` defeats an index exactly as ``LIKE '%x%'`` does.  These
+    cases feed the detectors directly, so they stay honest without depending on
+    what the route happens to issue today.
+    """
+
+    def test_content_count_recognises_every_spelling(self):
+        for sql in (
+            'SELECT COUNT(*) FROM pdf_fts WHERE pdf_fts MATCH ?',
+            'SELECT COUNT(1) FROM pdf_fts WHERE pdf_fts MATCH ?',
+            'SELECT COUNT(rowid) FROM pdf_fts',
+            'SELECT COUNT(*) FROM pdf_fts JOIN pdf_pages pp ON pp.id=pdf_fts.rowid',
+            'SELECT COUNT(*) FROM pdf_pages',
+            'select count( * ) from PDF_FTS',
+        ):
+            with self.subTest(sql=sql):
+                self.assertIsNotNone(content_count((sql, ())))
+
+    def test_content_count_leaves_other_counts_alone(self):
+        for sql in (
+            'SELECT COUNT(*) FROM collections',
+            'SELECT COUNT(*) FROM files f',
+            'SELECT f.id FROM pdf_fts WHERE pdf_fts MATCH ?',
+        ):
+            with self.subTest(sql=sql):
+                self.assertIsNone(content_count((sql, ())))
+
+    def test_like_scan_recognises_every_binding_shape(self):
+        cases = [
+            ('SELECT * FROM files f WHERE f.filename LIKE ?', ('%dragon%',)),
+            ("SELECT * FROM files f WHERE f.filename LIKE '%dragon%'", ()),
+            ("SELECT * FROM files f WHERE f.filename LIKE '%' || ? || '%'", ('dragon',)),
+            ("SELECT * FROM files f WHERE f.filename GLOB ?", ('*dragon*',)),
+            ("SELECT * FROM files f WHERE f.filename LIKE :pat", {'pat': '%dragon%'}),
+            ("SELECT * FROM files WHERE filename LIKE ?", ('%dragon%',)),
+            ("SELECT * FROM files f WHERE lower(f.filename) LIKE ?", ('%dragon%',)),
+            ("SELECT * FROM files f WHERE f.filename COLLATE NOCASE LIKE ?", ('%dragon%',)),
+        ]
+        for sql, params in cases:
+            with self.subTest(sql=sql, params=params):
+                self.assertIsNotNone(like_scan_on_files((sql, params)))
+
+    def test_like_scan_does_not_blame_another_table(self):
+        # A `files` reference elsewhere in the statement must not turn a
+        # collection-name search into a files scan: the column is matched
+        # tightly against the operator.
+        cases = [
+            ('SELECT * FROM collections c WHERE EXISTS(SELECT 1 FROM files f'
+             ' WHERE f.collection_id=c.id) AND c.name LIKE ?', ('%dragon%',)),
+            ('SELECT * FROM files f JOIN book_classification b ON b.rel_path=f.rel_path'
+             ' WHERE b.system LIKE ?', ('%dragon%',)),
+            # a trailing wildcard can still use the index
+            ('SELECT * FROM files f WHERE f.filename LIKE ?', ('dragon%',)),
+            ('SELECT * FROM files f WHERE f.filename LIKE ?', ('dragon',)),
+        ]
+        for sql, params in cases:
+            with self.subTest(sql=sql, params=params):
+                self.assertIsNone(like_scan_on_files((sql, params)))
+
+    def test_recorder_keeps_named_parameters(self):
+        con = sqlite3.connect(':memory:', factory=RecordingConnection)
+        try:
+            con.execute('SELECT :pat', {'pat': '%x%'})
+            self.assertEqual(con.statements[-1][1], {'pat': '%x%'})
+        finally:
+            con.close()
 
 
 if __name__ == '__main__':
