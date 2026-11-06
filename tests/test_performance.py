@@ -19,7 +19,10 @@ The rules
    an index) against a column of the ``files`` table, whether the pattern is a
    literal, a positional binding or a named one, and even when the column is
    wrapped in a function such as ``lower()``.  The live files total is a 2.8 s
-   query.
+   query.  The column set is read from ``catalog.SCHEMA`` rather than listed,
+   because the files section plans ``SEARCH f USING INTEGER PRIMARY KEY`` and
+   rule 3 never sees ``SCAN f`` there: rule 2 is the only guard, so a column
+   the schema grows must not slip past it.
 3. ``no_files_scan`` - no plan step that scans ``files`` end to end, in every
    section.  ``section=files`` is included: since #4 its search reads
    ``files_fts``, so the plan is ``SCAN files_fts`` and walking ``files``
@@ -113,10 +116,35 @@ URLS = {
 # the one section that queries it, and the suite stayed green.
 FILTERED_URLS = {name: url for name, url in URLS.items() if name != 'default'}
 
-FILES_COLUMNS = {
-    'id', 'collection_id', 'rel_path', 'filename', 'ext', 'kind', 'category',
-    'subcategory', 'size', 'mtime',
-}
+FILES_CONSTRAINTS = {'primary', 'unique', 'check', 'foreign', 'constraint'}
+
+
+def files_columns():
+    """The ``files`` columns, read from the schema the catalogue is built from.
+
+    Read rather than listed: rule 2 only recognises a wildcard on a column it
+    knows, and the files section plans ``SEARCH f USING INTEGER PRIMARY KEY`` -
+    never ``SCAN f`` - so the plan rule cannot back rule 2 up there.  A column
+    added to ``catalog.SCHEMA`` therefore has to widen this set by itself, or
+    the rule would quietly stop covering it.
+    ``test_files_columns_track_the_schema`` pins the parse against
+    ``PRAGMA table_info(files)``, so a definition this cannot read fails loudly
+    instead of narrowing the rule in silence.
+    """
+    body = re.search(
+        r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?files\s*\((.*?)\)\s*;',
+        catalog.SCHEMA, re.I | re.S)
+    if not body:                    # pinned by the test below; never silently empty
+        return set()
+    columns = set()
+    for definition in body.group(1).split(','):
+        words = definition.split()
+        if words and words[0].lower() not in FILES_CONSTRAINTS:
+            columns.add(words[0].strip('"\'').lower())
+    return columns
+
+
+FILES_COLUMNS = files_columns()
 # words that can follow "FROM files" without being a table alias
 NON_ALIAS = {
     'where', 'join', 'on', 'using', 'group', 'order', 'limit', 'indexed', 'not',
@@ -226,9 +254,14 @@ def like_scan_on_files(statement):
     for match in LIKE_PATTERN.finditer(sql):
         qualifier, column, operator = (match.group(1), match.group(2).lower(),
                                        match.group(3).lower())
-        if column not in FILES_COLUMNS:
-            continue
-        if qualifier and qualifier.lower() not in aliases:
+        if qualifier:
+            # ``f.some_column`` names the table it belongs to, so the column
+            # list adds nothing here and can only drop a column the schema grew
+            # after this file was written - a hole the plan rule cannot see
+            # through, because the files section searches `files` by rowid.
+            if qualifier.lower() not in aliases:
+                continue
+        elif column not in FILES_COLUMNS:
             continue
         value = bound_pattern(sql, match, params)
         if isinstance(value, str) and value.startswith(LEADING_WILDCARD[operator]):
@@ -604,6 +637,27 @@ class SearchPerformanceTests(unittest.TestCase):
             'EXPLAIN QUERY PLAN returned nothing; the plan rules would pass vacuously')
         self.assertIn('Dragon Compendium', self.recorded_request(URLS['content'])[0].text)
 
+    def test_files_columns_track_the_schema(self):
+        """The like rule's column list must be the `files` table, not a copy of it.
+
+        Rule 2 only recognises a wildcard on a column it knows, and the files
+        section plans ``SEARCH f USING INTEGER PRIMARY KEY`` - never ``SCAN f``
+        - so the plan rule cannot catch what rule 2 misses there.  A column
+        added to ``catalog.SCHEMA`` must therefore appear in the set by itself;
+        catching it here means a schema change cannot quietly narrow the rule.
+        """
+        con = sqlite3.connect(self.db_path)
+        try:
+            actual = {row[1].lower() for row in con.execute('PRAGMA table_info(files)')}
+        finally:
+            con.close()
+        self.assertTrue(actual, 'PRAGMA table_info(files) returned nothing')
+        self.assertEqual(
+            actual, FILES_COLUMNS,
+            'the like rule no longer knows every files column, so a leading '
+            'wildcard on the missing one would pass: '
+            f'{sorted(actual ^ FILES_COLUMNS)}')
+
 
 class DetectorTests(unittest.TestCase):
     """Pin the shapes the rules catch, and the ones they must leave alone.
@@ -650,6 +704,18 @@ class DetectorTests(unittest.TestCase):
         for sql, params in cases:
             with self.subTest(sql=sql, params=params):
                 self.assertIsNotNone(like_scan_on_files((sql, params)))
+
+    def test_like_scan_covers_a_qualified_column_it_never_heard_of(self):
+        """A qualified ``f.<column>`` names its table, so the list cannot veto it.
+
+        The files section searches `files` by rowid, so SQLite plans ``SEARCH f
+        USING INTEGER PRIMARY KEY`` and the plan rule never sees ``SCAN f``:
+        rule 2 is the only guard there.  Gating it on a column list would make
+        every column the schema grew after this file was written a silent hole.
+        """
+        sql = ('SELECT f.* FROM files f JOIN collections c ON c.id=f.collection_id'
+               ' WHERE f.sha_of_the_day LIKE ?')
+        self.assertIsNotNone(like_scan_on_files((sql, ('%dragon%',))))
 
     def test_like_scan_does_not_blame_another_table(self):
         # A `files` reference elsewhere in the statement must not turn a
