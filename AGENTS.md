@@ -51,7 +51,7 @@ docstring has the detail. Tests pin both ends of that boundary: raising the
 threshold past the length of the gate's query — where its own requests would
 start taking the fallback — fails `test_gate_measures_the_indexed_search_path`
 rather than quietly moving every rule onto a path it does not describe, and
-dropping the operator fallback fails
+dropping the operator filter fails
 `test_operator_queries_keep_the_substring_scan`. Removing the fallback would
 change search results, so it is a product decision rather than something the
 gate should assert.

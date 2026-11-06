@@ -107,13 +107,14 @@ class FilesSearchTests(unittest.TestCase):
     def test_operator_queries_keep_the_substring_scan(self):
         # fts_query drops AND/OR/NOT/NEAR, so an all-operator query leaves an
         # empty MATCH; use_fts requires a word, so the substring scan answers.
-        # A mid-token fragment can only be found that way - "and" inside
-        # "Brand", "Not" inside "Notes" - so an empty result here would mean
-        # the route reached the index with the operator instead.
+        # "and" sits mid-token in "Brand", which no token prefix can reach, so
+        # an empty result here would mean the route reached the index anyway.
+        # "not" is deliberately not tested: "Notes" is a token that starts with
+        # it, so the indexed path would find this file too and prove nothing.
         realm=self.library/'Books'/'01-DnD-and-d20'/'Test Realm'
         (realm/'Brand Notes.txt').write_text('notes')
         self.scan()
-        for q in ['and','not']:
+        for q in ['and']:
             with self.subTest(q=q):
                 self.assertTrue(self.old_result(q))
                 ids,_html=self.searched_ids(q)
