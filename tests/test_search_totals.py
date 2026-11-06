@@ -256,6 +256,72 @@ class SearchTotals(unittest.TestCase):
                 client.get('/search?q='+q+'&section=files')
         self.assertLessEqual(len(app._search_totals), 2)
 
+    def test_count_rows_tells_a_missing_index_from_a_busy_database(self):
+        """A missing index is a real zero; a database that would not answer is not.
+
+        `count_rows` used to read 0 for every `OperationalError`, which made a
+        locked database indistinguishable from an empty library.
+        """
+        import app
+
+        class Refusing:
+            def __init__(self, message):
+                self.message = message
+
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError(self.message)
+
+        class Answering:
+            def execute(self, *args, **kwargs):
+                return type('Cursor', (), {'fetchone': lambda self: (7,)})()
+
+        self.assertEqual(0, app.count_rows(Refusing('no such table: pdf_fts'), 'x'))
+        self.assertEqual(0, app.count_rows(Refusing('no such column: nope'), 'x'))
+        self.assertIsNone(app.count_rows(Refusing('database is locked'), 'x'))
+        self.assertIsNone(app.count_rows(Refusing('disk I/O error'), 'x'))
+        self.assertEqual(7, app.count_rows(Answering(), 'x'))
+
+    def test_a_failed_count_is_not_remembered(self):
+        """One busy moment must not read "Nothing found" for the whole TTL.
+
+        A locked database makes the count unable to answer. The request that hit
+        the lock shows a zero, but the cache must stay empty so the next request
+        asks again instead of serving the failure for a minute.
+        """
+        import app
+        self.build_index()
+        expected = self.content_total('dragon')
+        self.assertGreaterEqual(expected, 1)
+        app.clear_search_totals()
+        client = self.client()
+        real_db = app.db
+        state = {'busy': True}
+
+        class BusyConnection:
+            """A connection that is locked whenever a COUNT(*) is asked of it."""
+
+            def __init__(self, con):
+                self._con = con
+
+            def execute(self, sql, *args, **kwargs):
+                if state['busy'] and 'COUNT(*)' in sql.upper():
+                    raise sqlite3.OperationalError('database is locked')
+                return self._con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+
+        try:
+            app.db = lambda: BusyConnection(real_db())
+            failed = client.get('/search?q=dragon&section=content')
+            state['busy'] = False
+            recovered = client.get('/search?q=dragon&section=content')
+        finally:
+            app.db = real_db
+        self.assertEqual(failed.status_code, 200)
+        self.assertIn('· 0 results', failed.text)
+        self.assertIn('· {} results'.format(expected), recovered.text)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -515,6 +515,12 @@ def search_total(key, compute):
             return hit[1]
         generation = _search_totals_generation
     value = compute()
+    if value is None:
+        # The count could not be answered -- the database was busy or being
+        # rebuilt. Show the zero to this request, but never remember it: one
+        # hiccup would otherwise read "Nothing found" for the rest of the TTL,
+        # long after the catalogue was healthy again.
+        return 0
     # The window starts when the count *finishes*, not when it was asked for:
     # the content total takes 16 s on the live HDD catalogue, and timing it from
     # the start would quietly shorten the advertised minute to 44 s for exactly
@@ -545,11 +551,19 @@ def clear_search_totals():
 
 
 def count_rows(con, sql, args=()):
-    """COUNT(*) that reads 0 when the PDF index has not been built yet."""
+    """COUNT(*), or None when the database could not answer.
+
+    A missing table or column is the documented "index has not been built yet"
+    case and is a real zero. Anything else -- database is locked, disk I/O -- is
+    a transient failure, and saying 0 would report an empty library; returning
+    None lets the caller show a zero without remembering it.
+    """
     try:
         return con.execute(sql, args).fetchone()[0]
-    except sqlite3.OperationalError:
-        return 0
+    except sqlite3.OperationalError as exc:
+        if 'no such table' in str(exc) or 'no such column' in str(exc):
+            return 0
+        return None
 
 
 def has_pdf_index(con) -> bool:
