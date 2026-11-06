@@ -757,11 +757,14 @@ count comes back. It runs in CI and answers "did this change make a query scan?"
 not "how long does a section take".
 
 The rules describe the indexed path — a query of `FTS_MIN_CHARS` (three)
-characters or more. Below that threshold `files_filter` keeps a leading-wildcard
-`LIKE` over `files` on purpose (an FTS5 prefix of one or two characters matches
-most of the library), so `/search?q=d&section=files` still scans `files`. The
-gate does not measure that path and does not claim search never scans: see "What
-these rules do not cover" in the module docstring.
+characters or more that also leaves a word to match. Below that threshold
+`files_filter` keeps a leading-wildcard `LIKE` over `files` on purpose (an FTS5
+prefix of one or two characters matches most of the library), and a longer query
+whose words are all FTS operators or punctuation (`q=and`, `q=!!!`) takes the
+same path because `fts_query` reduces it to nothing to match. So
+`/search?q=d&section=files` still scans `files`. The gate does not measure those
+paths and does not claim search never scans: see "What these rules do not cover"
+in the module docstring.
 
 **`benchmarks/search_bench.py`** answers the second question. It builds a
 synthetic catalogue using the real schemas (`catalog.SCHEMA`,
