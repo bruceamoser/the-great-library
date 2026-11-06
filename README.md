@@ -107,9 +107,11 @@ Environment overrides:
 
 ### Database connection settings
 
-The catalogue is 3.66 GB and SQLite's defaults are tuned for a small file: a
-2 MB page cache, no memory map, temp tables on disk. Every connection
-therefore sets its own pragmas, in `sqlite_settings()` in `app.py`:
+The catalogue is a multi-gigabyte file (3.66 GB with ~1.7 GB of free pages on
+2026-11-04; 1.95 GB with an empty freelist on 2026-11-05) and SQLite's defaults
+are tuned for a small file: a 2 MB page cache, no memory map, temp tables on
+disk. Every connection therefore sets its own pragmas, in `sqlite_settings()`
+in `app.py`:
 
 | Pragma | Default | Meaning | Environment |
 |---|---|---|---|
@@ -395,7 +397,9 @@ and what it costs are recorded in
 [docs/adr/0001-search-architecture.md](docs/adr/0001-search-architecture.md).
 
 Current live catalogue, measured on 2026-11-04: **763 collections**, **25,227
-files**, **309,790 indexed pages**, `library.db` **3.66 GB**. (Older figures
+files**, **309,790 indexed pages**, `library.db` **3.66 GB**. By 2026-11-05 the
+file was **1.95 GB** with no free pages, so read the timings below as
+measurements of the arrangement, not of today's file size. (Older figures
 elsewhere in this README describe the October restructure as it stood then.)
 
 | Query on the live catalogue | HDD (live host) | NVMe (copy) |
@@ -460,18 +464,44 @@ ionice -c2 -n7 nice -n 19 ./.venv/bin/python index_pdf_text.py \
     --library /mnt/disk5/RPG-Library --db library.db --migrate --vacuum
 ```
 
-`--migrate` is idempotent (a second run does nothing) and every indexing run
-also performs it automatically. `--vacuum` rewrites the database and reports
-the size before and after; on the host database that is where the ~1.7 GB of
-free pages left by earlier delete/insert cycles is reclaimed. No PDF is
-re-extracted unless `--rebuild` is also given.
+`--migrate` is idempotent (a second run skips the migration) and every indexing
+run also performs it automatically. `--vacuum` only takes effect alongside
+`--migrate`: together they fold the freelist back into the file and print the
+size before and after, while `--vacuum` on its own is ignored and the run falls
+through to incremental indexing. No PDF is re-extracted unless `--rebuild` is
+also given.
+
+Measured on 2026-11-05 against a copy of the live catalogue (1.95 GB, 309,790
+indexed pages, empty freelist):
+
+| | |
+|---|---|
+| Wall time | 41 s on the NVMe system disk |
+| Hit parity, 10 representative queries | identical counts and per-hit `rel_path`+`page` hashes |
+| `pdf_fts` `integrity-check` / `PRAGMA integrity_check` | ok / ok |
+| `pdf_status` | 5,134 rows, identical before and after |
+| Size | 1,951,019,008 → **1,756,016,640 bytes**: 195 MB smaller (10.0%) |
+| Peak file during the run | 3.24 GB |
+| Second `--migrate --vacuum` | migration skipped and freelist 0, so nothing is reclaimed — though VACUUM still rewrites the whole file |
+
+What VACUUM reclaims here is the freelist that dropping the old `pdf_fts`
+leaves behind — 361,581 free pages (1.48 GB) at the moment `--vacuum` starts,
+not free pages that predate the migration. Budget about **3 GB of free space**,
+split between two filesystems: the file beside `library.db` grows by ~1.3 GB
+while the old and new layouts are both on disk, and VACUUM writes a temporary
+copy the size of the finished database (~1.8 GB) into the system temp
+directory — `SQLITE_TMPDIR` if set, else `TMPDIR`, else `/var/tmp` or
+`/tmp` — not beside `library.db`. If temp is the smaller filesystem, point
+`SQLITE_TMPDIR` at the catalogue's disk first. Expect a 10% saving rather than
+the multi-gigabyte one projected when #6 was scoped: that projection assumed
+the 3.66 GB file with 416,457 free pages (~1.7 GB) measured on 2026-11-04, and
+the live catalogue is now 1.95 GB with no free pages to reclaim.
 
 Deploy the new code first: until the migration runs, the app treats the content
-index as absent and simply shows no inside-book results. The migration itself
-copies every page once, so keep the same `ionice`/`nice` wrapper and allow a
-few minutes; `--vacuum` additionally needs temporary free space roughly equal
-to the final database size (~2 GB). Run it at a quiet moment: if SQLite reports
-the database is locked during `VACUUM`, re-run the same command — the schema
+index as absent and simply shows no inside-book results. The 41 s above is the
+NVMe copy; the host's catalogue is on a spinning disk, so allow a few minutes
+there for the same pass. Run it at a quiet moment: if SQLite reports the
+database is locked during `VACUUM`, re-run the same command — the schema
 upgrade is already committed and is skipped, and only the VACUUM is retried.
 
 A full rebuild takes tens of minutes because every PDF must be re-extracted;
