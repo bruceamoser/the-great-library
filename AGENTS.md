@@ -37,6 +37,16 @@ enforced, so a reintroduced scan fails the suite; there is no skip list.
 cold: the totals cache is emptied before each sample, so the figure covers the
 query the section needs rather than a cache hit.
 
+The rules describe the **indexed** path — a query of `FTS_MIN_CHARS` (three)
+characters or more. A one- or two-character query deliberately keeps the
+leading-wildcard `LIKE` scan of `files`, because an FTS5 prefix that short
+matches most of the library: `/search?q=d&section=files` still scans `files`,
+and the gate neither measures that path nor claims otherwise. "What these rules
+do not cover" in the module docstring has the detail; a test pins the boundary,
+so raising the threshold fails there rather than quietly moving every rule onto
+a path it does not describe. Removing the fallback would change search results,
+so it is a product decision rather than something the gate should assert.
+
 ## Measuring search
 
 That gate answers "did this change make a query scan?"; it does not say how long
