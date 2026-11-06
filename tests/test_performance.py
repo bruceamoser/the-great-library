@@ -493,6 +493,10 @@ class SearchPerformanceTests(unittest.TestCase):
           from the index, so the boundary itself cannot drift by one without
           this failing.
 
+        The boundary sample is also checked for being a real success that read
+        ``files_fts``: a 500, or a request answered from somewhere else, would
+        record no statements and let the check above pass vacuously.
+
         Neither asserts anything about the fallback below the threshold: it is
         deliberate, pinned by ``test_files_search``, and removing it would
         change search results.
@@ -504,7 +508,11 @@ class SearchPerformanceTests(unittest.TestCase):
             f'({app.FTS_MIN_CHARS}), so the rules would measure the substring '
             'fallback instead of the indexed search')
         url = f'/search?q={QUERY.strip()[:app.FTS_MIN_CHARS]}&section=files'
-        _response, _elapsed, statements = self.run_request(url)
+        response, _elapsed, statements = self.run_request(url)
+        # An error response records no statements, so every assertion after this
+        # point would pass for the wrong reason. The sample has to be a real 200
+        # that reached the index, or the boundary is not being measured at all.
+        self.assertEqual(response.status_code, 200, url)
         offenders = [offender
                      for offender in map(like_scan_on_files, statements)
                      if offender]
@@ -513,6 +521,13 @@ class SearchPerformanceTests(unittest.TestCase):
             offenders, [],
             f'a query of exactly FTS_MIN_CHARS characters ({url}) fell back to '
             'the substring scan:\n\n    ' + '\n\n    '.join(offenders))
+        self.assertTrue(
+            any(FILES_FTS_READ.search(sql)
+                for sql, _params in statements
+                if READ_STATEMENT.match(sql)),
+            f'a query of exactly FTS_MIN_CHARS characters ({url}) executed no '
+            'statement that reads FROM or JOIN files_fts, so this measured '
+            'something other than the indexed path')
 
     def test_unplannable_statements_are_reported_not_skipped(self):
         """A statement SQLite will not plan must fail, not vanish from the rule."""
