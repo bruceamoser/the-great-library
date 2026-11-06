@@ -5,7 +5,9 @@ The four tab totals used to be computed on every request: a COUNT(*) over
 file row (2.8 s) among them, while the default tab needs none of it. These
 tests trace the SQL the route really executes.
 """
+import os
 import sqlite3
+import time
 import unittest
 from unittest.mock import patch
 
@@ -154,6 +156,96 @@ class SearchTotals(unittest.TestCase):
             # ... and a miss once it has
             clock[0] = 1016.0 + app.SEARCH_TOTAL_TTL
             self.assertEqual(app.search_total(key, lambda: 7), 7)
+
+    def test_a_rescan_during_a_slow_count_is_not_undone(self):
+        """A count that began before a rescan must not be cached after it.
+
+        `clear_search_totals()` runs when a rescan finishes, but the content
+        total takes 16 s on the live HDD catalogue, so the rescan lands while a
+        count is still running. Storing that value afterwards puts a pre-rescan
+        total back into the cache that was just emptied, and it is served for
+        the whole TTL -- the opposite of what clearing after a rescan is for.
+        """
+        import app
+        app.clear_search_totals()
+        key = (str(self.db), 'content', 'dragon', '', '', '', '', '')
+
+        def count_while_rescanning():
+            app.clear_search_totals()      # the rescan finishes mid-count
+            return 42                      # ... counted against the old catalogue
+
+        # The in-flight request still renders what it counted ...
+        self.assertEqual(app.search_total(key, count_while_rescanning), 42)
+        # ... but it does not get to leave that number behind for everyone else.
+        self.assertNotIn(key, app._search_totals)
+        self.assertEqual(app.search_total(key, lambda: 7), 7)
+
+    def test_renaming_a_collection_forgets_its_cached_count(self):
+        """The collections tab counts the name, so a rename invalidates it.
+
+        Without a clear, `/search` keeps reporting the pre-rename total for the
+        rest of the TTL, which is the one thing the cache is not allowed to do.
+        """
+        import app
+        cid = self.rows('SELECT id FROM collections ORDER BY id LIMIT 1')[0][0]
+        client = self.client()
+        app.clear_search_totals()
+        before = client.get('/search?q=Realm&section=collections')
+        self.assertIn('· 1 results', before.text)
+        response = client.post(
+            '/api/metadata/' + str(cid), headers={'X-Library-Request': '1'},
+            json={'name': 'Renamed Shelf', 'family': 'Custom', 'publisher': 'My Press',
+                  'genre': 'fantasy', 'cover_file': '', 'cover_page': 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        after = client.get('/search?q=Realm&section=collections')
+        self.assertIn('· 0 results', after.text)
+
+    def test_reclassifying_a_book_forgets_the_cached_file_count(self):
+        """The files tab counts `files_fts`, which a manual edit rewrites."""
+        import app
+        fid = self.rows('SELECT id FROM files ORDER BY id LIMIT 1')[0][0]
+        client = self.client()
+        app.clear_search_totals()
+        before = client.get('/search?q=Zorblax&section=files')
+        self.assertIn('· 0 results', before.text)
+        response = client.post(
+            '/api/book-metadata/' + str(fid), headers={'X-Library-Request': '1'},
+            json={'system': 'Zorblax', 'edition': '1e', 'series': '', 'campaign': '',
+                  'volume': None, 'role': 'core-rules'})
+        self.assertEqual(response.status_code, 200, response.text)
+        after = client.get('/search?q=Zorblax&section=files')
+        self.assertIn('· 1 results', after.text)
+
+    def test_an_import_forgets_the_totals_it_invalidated(self):
+        """An inbox import rebuilds the catalogue in a child process.
+
+        That child cannot clear this process's cache, so the totals it replaced
+        have to be dropped here or `/search` keeps counting the old catalogue.
+        """
+        import app
+        import inbox
+        import jobs
+        arrivals = self.library/'_Inbox'
+        arrivals.mkdir(exist_ok=True)
+        (arrivals/'Rapscallion-Maps.txt').write_text('map')
+        client = self.client()
+        app.clear_search_totals()
+        client.get('/search?q=dragon&section=files')          # warm a total
+        self.assertTrue(app._search_totals)
+        with patch.object(jobs, 'BASE', self.root), \
+                patch.dict(os.environ, self.env), \
+                patch.object(inbox, 'process_batch', lambda *a, **k: ([], [])):
+            plan = client.get('/api/inbox/plan').json()
+            response = client.post(
+                '/api/inbox/process', headers={'X-Library-Request': '1'},
+                json={'automatic': True, 'groups': plan['groups']})
+            self.assertEqual(response.status_code, 202, response.text)
+            # jobs.record() finishes before the worker's finally runs, so wait
+            # for the clear itself rather than for the job flag.
+            deadline = time.monotonic() + 10
+            while app._search_totals and time.monotonic() < deadline:
+                time.sleep(.02)
+        self.assertEqual(app._search_totals, {})
 
     def test_total_cache_stays_bounded(self):
         import app

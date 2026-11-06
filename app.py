@@ -500,6 +500,10 @@ SEARCH_TOTAL_TTL = 60.0
 SEARCH_TOTAL_CACHE_MAX = 128
 _search_totals = {}
 _search_totals_lock = threading.Lock()
+# Bumped by every clear_search_totals(). A count runs outside the lock, so it
+# can straddle a rescan; the generation tells it whether the values it saw are
+# still the ones the caller asked about.
+_search_totals_generation = 0
 
 
 def search_total(key, compute):
@@ -509,6 +513,7 @@ def search_total(key, compute):
         hit = _search_totals.get(key)
         if hit and hit[0] > now:
             return hit[1]
+        generation = _search_totals_generation
     value = compute()
     # The window starts when the count *finishes*, not when it was asked for:
     # the content total takes 16 s on the live HDD catalogue, and timing it from
@@ -516,6 +521,12 @@ def search_total(key, compute):
     # the total this cache exists to avoid recomputing.
     stored = time.monotonic()
     with _search_totals_lock:
+        # A rescan that finished while this count was running has already
+        # forgotten what it replaced. Storing the value would undo that clear
+        # and serve a pre-rescan total for the rest of the TTL, so this request
+        # renders what it counted and leaves the cache alone.
+        if generation != _search_totals_generation:
+            return value
         if len(_search_totals) >= SEARCH_TOTAL_CACHE_MAX:
             for stale in [k for k, v in _search_totals.items() if v[0] <= stored]:
                 del _search_totals[stale]
@@ -527,8 +538,10 @@ def search_total(key, compute):
 
 def clear_search_totals():
     """Forget every cached total; call it after the catalogue changes."""
+    global _search_totals_generation
     with _search_totals_lock:
         _search_totals.clear()
+        _search_totals_generation += 1
 
 
 def count_rows(con, sql, args=()):
@@ -1348,6 +1361,9 @@ async def edit_metadata(cid:int,request:Request):
                 con.execute('UPDATE classification_audit SET assigned_shelf=?,rule="manual",needs_review=0 WHERE rel_path=?',(clean['shelf'],row['rel_path']))
                 con.commit()
             finally:con.close()
+        # A renamed collection, family or publisher changes what the collections
+        # tab counts, so the totals cached under the old name are now wrong.
+        clear_search_totals()
     except RuntimeError as exc:raise HTTPException(409,str(exc))
     return {'ok':True}
 
@@ -1445,6 +1461,9 @@ async def edit_book_metadata(fid:int,request:Request):
                 catalog.reindex_file(con,fid)
                 con.commit()
             finally:con.close()
+        # The system, series and campaign feed the files tab's own filter, so a
+        # total cached before this edit no longer matches the catalogue.
+        clear_search_totals()
     except RuntimeError as exc:raise HTTPException(409,str(exc))
     return {'ok':True}
 
@@ -1527,7 +1546,11 @@ async def inbox_process(request:Request):
                 finally:con.close()
                 jobs.record('inbox',running=False,finished=time.time(),result_collections=links,message=f'Imported {len(results)} collections. {len(plan["review"])} inbox items still need review.',error='; '.join(errors) or None)
             except Exception as exc:jobs.record('inbox',running=False,finished=time.time(),error=str(exc),message='Import needs attention')
-            finally:lease.__exit__(None,None,None)
+            finally:
+                lease.__exit__(None,None,None)
+                # The import rebuilt the catalogue in a child process, so the
+                # totals cached by this one describe collections that have moved.
+                clear_search_totals()
         threading.Thread(target=work,daemon=True).start()
     except Exception:
         lease.__exit__(None,None,None)
