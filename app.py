@@ -515,6 +515,12 @@ def search_total(key, compute):
             return hit[1]
         generation = _search_totals_generation
     value = compute()
+    if value is None:
+        # The count could not be answered -- the database was busy or being
+        # rebuilt. Return the unknown, never a zero and never a remembered
+        # value: one hiccup would otherwise read "0 results" for the rest of
+        # the TTL, long after the catalogue was healthy again.
+        return None
     # The window starts when the count *finishes*, not when it was asked for:
     # the content total takes 16 s on the live HDD catalogue, and timing it from
     # the start would quietly shorten the advertised minute to 44 s for exactly
@@ -545,11 +551,20 @@ def clear_search_totals():
 
 
 def count_rows(con, sql, args=()):
-    """COUNT(*) that reads 0 when the PDF index has not been built yet."""
+    """COUNT(*), or None when the database could not answer.
+
+    A missing table or column is the documented "index has not been built yet"
+    case and is a real zero. Anything else -- database is locked, disk I/O -- is
+    a transient failure, and saying 0 would report an empty library. Returning
+    None lets the caller leave the total unstated and remember nothing, so the
+    next request asks again.
+    """
     try:
         return con.execute(sql, args).fetchone()[0]
-    except sqlite3.OperationalError:
-        return 0
+    except sqlite3.OperationalError as exc:
+        if 'no such table' in str(exc) or 'no such column' in str(exc):
+            return 0
+        return None
 
 
 def has_pdf_index(con) -> bool:
@@ -565,6 +580,16 @@ def has_pdf_index(con) -> bool:
         return {'pdf_fts', 'pdf_pages'} <= names
     except sqlite3.OperationalError:      # pragma: no cover - closed database
         return False
+
+
+# Normally the page count bounds `page`, and with it the OFFSET handed to
+# SQLite. When the total is unknown there is no page count, so the page number
+# arrives unvalidated from the query string: SQLite binds OFFSET as a 64-bit
+# integer and raises OverflowError (a 500) on anything larger, and a merely
+# large one becomes a long scan. This is comfortably above any real page count
+# -- the live catalogue's largest section is ~8,600 pages of 36 -- so it only
+# ever bites on a hand-typed number.
+SEARCH_PAGE_LIMIT = 10000
 
 
 @app.get('/search', response_class=HTMLResponse)
@@ -617,7 +642,16 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         totals['content']=search_total(key,lambda: count_rows(con,'SELECT COUNT(*)'+pj+pw,pp))
     else:
         totals['content']=0
-    pages=max(1,(totals[section]+size-1)//size); page=min(page,pages)
+    total=totals[section]
+    if total is None:
+        # The database would not answer this count. Deriving a page count from
+        # it would state a false "0 results" beside a table of hits and rewind a
+        # deep page to page 1, so say nothing about the total and leave the
+        # requested page alone -- but bound it, since the page count is what
+        # used to bound the OFFSET.
+        pages=None; page=min(page,SEARCH_PAGE_LIMIT)
+    else:
+        pages=max(1,(total+size-1)//size); page=min(page,pages)
     offset=(page-1)*size
     collections=[]; files=[]; content_hits=[]
     if section=='collections':
@@ -628,6 +662,23 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         files=con.execute('SELECT f.*,c.name collection_name,c.shelf'+join+fw+' ORDER BY '+order+' LIMIT ? OFFSET ?',fp+[size,offset]).fetchall()
     elif match and index_available:
         content_hits=con.execute("SELECT f.id fid,pp.page,f.filename,c.id cid,c.name collection_name,c.shelf,snippet(pdf_fts,0,'<<','>>',' … ',24) snip"+pj+pw+' ORDER BY rank LIMIT ? OFFSET ?',pp+[size,offset]).fetchall()
+    campaign_page=campaign_items[offset:offset+size]
+    # With no total there is no page count to compare against, so a full page is
+    # the only evidence available that another one exists.
+    shown={'collections':len(collections),'files':len(files),
+           'content':len(content_hits),'campaigns':len(campaign_page)}[section]
+    # But not on the cap: SEARCH_PAGE_LIMIT rewrites page+1 back to the page just
+    # rendered, so a link there could never advance.
+    next_page=(shown>=size and page<SEARCH_PAGE_LIMIT) if pages is None else page<pages
+    # The page is blank only when it rendered no list at all -- the "Inside
+    # books" hits are shown on the campaigns tab too, so this cannot be decided
+    # from the active section alone. And blank only means the library has
+    # nothing when it is the first page: with no total, a deep page can come
+    # back empty because its results are on an earlier page, and "Nothing found."
+    # there would report an empty library the database never said was empty.
+    blank=not (collections or files or content_hits or campaign_page)
+    no_results=blank and page==1
+    empty_page=blank and page>1
     all_tags=con.execute('SELECT name FROM tags ORDER BY name').fetchall()
     shelves=con.execute('SELECT DISTINCT shelf FROM collections ORDER BY shelf').fetchall()
     con.close()
@@ -637,10 +688,11 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
         return '/search?'+urlencode({k:v for k,v in values.items() if v!=''})
     return templates.TemplateResponse(request,'search.html',dict(
         q=q,shelf=shelf,kind=kind,tag=tag,cat=cat,subcat=subcat,mode='query' if q else 'filter',
-        campaigns=campaign_items[offset:offset+size],collections=collections,files=files,content_hits=content_hits,highlight=highlight,
+        campaigns=campaign_page,collections=collections,files=files,content_hits=content_hits,highlight=highlight,
         all_tags=all_tags,shelves=shelves,shelf_label=shelf_label,kinds=KIND_ORDER,
         cats=CATEGORY_ORDER,subcats=SUBCATEGORY,category_label=CATEGORY_LABEL,
-        subcategory_label=SUBCATEGORY_LABEL,totals=totals,page=page,pages=pages,
+        subcategory_label=SUBCATEGORY_LABEL,totals=totals,page=page,pages=pages,next_page=next_page,
+        no_results=no_results,empty_page=empty_page,
         section=section,sort=sort,result_url=result_url,index_available=index_available))
 
 
