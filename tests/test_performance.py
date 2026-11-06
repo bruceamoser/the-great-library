@@ -19,10 +19,13 @@ The rules
    an index) against a column of the ``files`` table, whether the pattern is a
    literal, a positional binding or a named one, and even when the column is
    wrapped in a function such as ``lower()``.  The live files total is a 2.8 s
-   query.  The column set is read from ``catalog.SCHEMA`` rather than listed,
-   because the files section plans ``SEARCH f USING INTEGER PRIMARY KEY`` and
-   rule 3 never sees ``SCAN f`` there: rule 2 is the only guard, so a column
-   the schema grows must not slip past it.
+   query.  A qualified ``f.<column>`` is matched on its qualifier alone - the
+   qualifier names the table, so a column list could only veto a column the
+   schema grew after this file was written.  An unqualified column must instead
+   be in a list read from ``catalog.SCHEMA`` rather than copied by hand.  That
+   list is what the files section leans on, because it plans ``SEARCH f USING
+   INTEGER PRIMARY KEY`` and rule 3 never sees ``SCAN f`` there: rule 2 is the
+   only guard, so a column the schema grows must not slip past it.
 3. ``no_files_scan`` - no plan step that scans ``files`` end to end, in every
    section.  ``section=files`` is included: since #4 its search reads
    ``files_fts``, so the plan is ``SCAN files_fts`` and walking ``files``
