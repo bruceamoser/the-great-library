@@ -484,6 +484,35 @@ class SearchTotals(unittest.TestCase):
         # A known total still clamps to the last real page, exactly as before.
         self.assertIn('Page 1 of 1 · 2 results', healthy.text)
 
+    def test_the_page_cap_is_not_a_dead_end(self):
+        """The cap bounds the page, so a page sitting on it leads nowhere.
+
+        With no total the next link comes from the page being full, and its
+        target is page+1 -- which SEARCH_PAGE_LIMIT rewrites straight back to
+        the page already rendered. A full page on the cap would therefore offer
+        a link that never advances. Below the cap the link still has to appear,
+        or results past the first page become unreachable.
+        """
+        import app
+        self.make_files(72)                 # 2 fixture files + 72 = two full pages, then a short one
+        app.clear_search_totals()
+        client = self.client()
+        state, real_db = self.refusing_counts()
+        try:
+            with patch.object(app, 'SEARCH_PAGE_LIMIT', 2):
+                below_cap = client.get('/search?section=files')
+                on_cap = client.get('/search?section=files&page=2')
+        finally:
+            app.db = real_db
+        # Below the cap a full page still leads on: the guard must not hide a
+        # page the reader can actually reach.
+        self.assertIn('<span>Page 1</span>', self.nav(below_cap.text))
+        self.assertIn('Next page', below_cap.text)
+        # On the cap the same link would be rewritten back to this page.
+        self.assertIn('<span>Page 2</span>', self.nav(on_cap.text))
+        self.assertNotIn('Next page', on_cap.text)
+        self.assertIn('← Previous', on_cap.text)
+
     def test_content_hits_on_another_tab_are_not_nothing(self):
         """An empty campaign list is not an empty page.
 

@@ -667,7 +667,9 @@ def search(request: Request, q: str = '', shelf: str = '', kind: str = '',
     # the only evidence available that another one exists.
     shown={'collections':len(collections),'files':len(files),
            'content':len(content_hits),'campaigns':len(campaign_page)}[section]
-    next_page=shown>=size if pages is None else page<pages
+    # But not on the cap: SEARCH_PAGE_LIMIT rewrites page+1 back to the page just
+    # rendered, so a link there could never advance.
+    next_page=(shown>=size and page<SEARCH_PAGE_LIMIT) if pages is None else page<pages
     # The page is blank only when it rendered no list at all -- the "Inside
     # books" hits are shown on the campaigns tab too, so this cannot be decided
     # from the active section alone. And blank only means the library has
